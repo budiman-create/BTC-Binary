@@ -118,6 +118,73 @@ def estimate_momentum_drift(df: pd.DataFrame, lookback_min: int = 5) -> float:
     return float(max(-20.0, min(20.0, annual)))
 
 
+def estimate_chart_signal(df: pd.DataFrame, lookback_min: int = 5) -> tuple[float, dict]:
+    """
+    Combines EMA cross, price position, and volume into an annualised drift signal.
+
+    Three components:
+      1. EMA cross (EMA9 vs EMA21) — primary trend direction and strength
+      2. Price position relative to EMAs — confirms or weakens the trend
+      3. Volume confirmation — scales signal up if recent volume is elevated
+
+    Blended 70/30 with raw 5-min momentum so the chart and the model agree.
+    Returns (annual_drift, signal_details_dict).
+    """
+    close  = df["Close"].squeeze()
+    volume = df["Volume"].squeeze()
+
+    ema9  = close.ewm(span=9,  adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+
+    c  = float(close.iloc[-1])
+    e9  = float(ema9.iloc[-1])
+    e21 = float(ema21.iloc[-1])
+
+    # 1 — EMA cross: fractional separation → annual drift scale
+    ema_sep   = (e9 - e21) / e21  # positive = EMA9 above = bullish
+    ema_drift = math.copysign(min(abs(ema_sep) * 3000, 10.0), ema_sep)
+
+    # 2 — Price position vs EMAs
+    bullish_cross = e9 > e21
+    if bullish_cross and c > e9:
+        pos_drift =  4.0   # price above fast EMA in uptrend — full confirmation
+    elif bullish_cross and c > e21:
+        pos_drift =  2.0   # price between EMAs — pullback in uptrend
+    elif bullish_cross:
+        pos_drift =  0.0   # uptrend but price below both — caution
+    elif not bullish_cross and c < e9:
+        pos_drift = -4.0   # price below fast EMA in downtrend — full confirmation
+    elif not bullish_cross and c < e21:
+        pos_drift = -2.0   # price between EMAs — rally in downtrend
+    else:
+        pos_drift =  0.0   # downtrend but price above both — caution
+
+    # 3 — Volume confirmation
+    recent_vol = float(volume.tail(5).mean())
+    avg_vol    = float(volume.mean())
+    vol_factor = min(1.4, max(0.6, recent_vol / avg_vol)) if avg_vol > 0 else 1.0
+
+    # Combine EMA cross + price position, scale by volume
+    chart_signal = (ema_drift * 0.6 + pos_drift * 0.4) * vol_factor
+
+    # Blend with raw momentum (keeps short-term price action in the mix)
+    momentum = estimate_momentum_drift(df, lookback_min)
+    blended  = chart_signal * 0.70 + momentum * 0.30
+
+    drift = float(max(-20.0, min(20.0, blended)))
+
+    details = {
+        "ema_cross":    "Bullish" if bullish_cross else "Bearish",
+        "price_pos":    "Above Both" if (bullish_cross and c > e9)
+                        else "Below Both" if (not bullish_cross and c < e9)
+                        else "Between",
+        "vol_factor":   round(vol_factor, 2),
+        "ema9":         round(e9, 2),
+        "ema21":        round(e21, 2),
+    }
+    return drift, details
+
+
 def estimate_tail_dof(df: pd.DataFrame, window: int = VOL_WINDOW) -> float:
     """
     Estimate Student-t degrees of freedom from recent log-return kurtosis.

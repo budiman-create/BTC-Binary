@@ -18,6 +18,7 @@ from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -38,7 +39,7 @@ st.set_page_config(
 # Cached data fetchers (cache 25 sec so auto-refresh gets fresh data)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=25)
+@st.cache_data(ttl=8)
 def get_live_price(symbol: str):
     from stock_agent.robinhood_crypto import RobinhoodCryptoClient, fetch as rh_fetch
     from stock_agent.market_state import Horizon
@@ -55,14 +56,14 @@ def get_live_price(symbol: str):
         return {"error": str(e)}
 
 
-@st.cache_data(ttl=25)
+@st.cache_data(ttl=8)
 def get_intraday(symbol: str, hours: int = 3):
     from stock_agent.prediction_market import (
         fetch_intraday, realised_vol_annual, garch_vol_annual,
-        estimate_momentum_drift, estimate_tail_dof,
+        estimate_chart_signal, estimate_tail_dof,
     )
     df = fetch_intraday(symbol, lookback_hours=hours)
-    drift   = estimate_momentum_drift(df)
+    drift, signal_details = estimate_chart_signal(df)
     tail_dof = estimate_tail_dof(df)
     try:
         vol = garch_vol_annual(df, window=60)
@@ -70,10 +71,10 @@ def get_intraday(symbol: str, hours: int = 3):
     except Exception:
         vol = realised_vol_annual(df, window=60)
         vol_source = "Realised"
-    return df, vol, drift, vol_source, tail_dof
+    return df, vol, drift, vol_source, tail_dof, signal_details
 
 
-@st.cache_data(ttl=25)
+@st.cache_data(ttl=8)
 def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: int,
                annual_drift: float = 0.0, tail_dof: float = 30.0):
     from stock_agent.prediction_market import probability_ladder, sigma_over_horizon
@@ -95,7 +96,7 @@ with st.sidebar:
     bankroll     = st.number_input("Bankroll ($)", min_value=100, value=1000, step=100)
     vol_window   = st.slider("Vol estimation window (min)", 10, 120, 60)
     alert_threshold = st.slider("Alert edge threshold (%)", 3, 20, 8)
-    auto_refresh = st.checkbox("Auto-refresh every 30s", value=True)
+    auto_refresh = st.checkbox("Auto-refresh every 10s", value=True)
 
     st.divider()
     st.caption("Data: Robinhood (live price) + yfinance (1-min candles)")
@@ -121,7 +122,7 @@ if "error" in price_data:
 current_price = price_data["price"]
 
 try:
-    df_intraday, annual_vol, annual_drift, vol_source, tail_dof = get_intraday(symbol)
+    df_intraday, annual_vol, annual_drift, vol_source, tail_dof, signal_details = get_intraday(symbol)
 except Exception as e:
     st.error(f"Could not fetch intraday data: {e}")
     st.stop()
@@ -129,12 +130,20 @@ except Exception as e:
 from stock_agent.prediction_market import sigma_over_horizon
 sig_T = sigma_over_horizon(annual_vol, horizon)
 
-# Momentum label for display
+# Initialize strike early so the chart can use it before the right column renders
+if "strike_val" not in st.session_state:
+    st.session_state["strike_val"] = float(round(current_price, 2))
+
+# Momentum label — driven by chart signal now
+ema_cross = signal_details["ema_cross"]
+price_pos = signal_details["price_pos"]
+vol_fac   = signal_details["vol_factor"]
+
 if annual_drift > 5:
-    drift_label = "Bullish"
+    drift_label = f"{ema_cross} Cross"
     drift_delta = f"+{annual_drift:.1f} drift"
 elif annual_drift < -5:
-    drift_label = "Bearish"
+    drift_label = f"{ema_cross} Cross"
     drift_delta = f"{annual_drift:.1f} drift"
 else:
     drift_label = "Neutral"
@@ -153,7 +162,14 @@ col5.metric(f"{horizon}-min Sigma", f"{sig_T:.3%}")
 col6.metric("Momentum", drift_label, delta=drift_delta)
 
 dof_display = f"{tail_dof:.1f}" if tail_dof < 30 else "Normal"
-st.caption(f"Tail model: Student-t dof={dof_display}  |  {'Fatter tails than normal — OTM probabilities boosted' if tail_dof < 15 else 'Near-normal tails'}")
+st.caption(
+    f"Tail model: Student-t dof={dof_display}  |  "
+    f"{'Fatter tails — OTM probabilities boosted' if tail_dof < 15 else 'Near-normal tails'}  |  "
+    f"EMA cross: **{signal_details['ema_cross']}**  |  "
+    f"Price: {signal_details['price_pos']}  |  "
+    f"Vol factor: {signal_details['vol_factor']:.2f}x  |  "
+    f"EMA9: ${signal_details['ema9']:,.0f}  EMA21: ${signal_details['ema21']:,.0f}"
+)
 
 # ---------------------------------------------------------------------------
 # Watchlist — evaluate every refresh, alert if edge crosses threshold
@@ -208,32 +224,97 @@ left, right = st.columns([3, 2], gap="large")
 
 # ---- Price chart -----------------------------------------------------------
 with left:
-    st.subheader("Price (1-min candles)")
+    st.subheader("Price Action (1-min candles)")
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df_intraday.index,
-        y=df_intraday["Close"].squeeze(),
-        mode="lines",
-        line=dict(color="#00d4aa", width=1.5),
+    # EMAs
+    df_chart = df_intraday.copy()
+    close = df_chart["Close"].squeeze()
+    df_chart["EMA9"]  = close.ewm(span=9,  adjust=False).mean()
+    df_chart["EMA21"] = close.ewm(span=21, adjust=False).mean()
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.75, 0.25],
+        vertical_spacing=0.03,
+    )
+
+    # Candlesticks
+    fig.add_trace(go.Candlestick(
+        x=df_chart.index,
+        open=df_chart["Open"].squeeze(),
+        high=df_chart["High"].squeeze(),
+        low=df_chart["Low"].squeeze(),
+        close=close,
+        increasing=dict(line=dict(color="#00d4aa"), fillcolor="#00d4aa"),
+        decreasing=dict(line=dict(color="#ff6b6b"), fillcolor="#ff6b6b"),
         name="BTC",
-    ))
+    ), row=1, col=1)
+
+    # EMA 9
+    fig.add_trace(go.Scatter(
+        x=df_chart.index,
+        y=df_chart["EMA9"].squeeze(),
+        mode="lines",
+        line=dict(color="#ffd700", width=1.2),
+        name="EMA 9",
+    ), row=1, col=1)
+
+    # EMA 21
+    fig.add_trace(go.Scatter(
+        x=df_chart.index,
+        y=df_chart["EMA21"].squeeze(),
+        mode="lines",
+        line=dict(color="#ff8c00", width=1.2),
+        name="EMA 21",
+    ), row=1, col=1)
+
+    # Live price line
     fig.add_hline(
         y=current_price,
         line_dash="dot",
-        line_color="yellow",
+        line_color="white",
         annotation_text=f"Live ${current_price:,.0f}",
         annotation_position="top right",
+        row=1, col=1,
     )
+
+    # Strike price line (from contract evaluator)
+    strike_val = st.session_state.get("strike_val")
+    if strike_val and abs(strike_val - current_price) / current_price > 0.0001:
+        fig.add_hline(
+            y=strike_val,
+            line_dash="dash",
+            line_color="#a78bfa",
+            annotation_text=f"Strike ${strike_val:,.2f}",
+            annotation_position="bottom right",
+            row=1, col=1,
+        )
+
+    # Volume bars (green if candle up, red if down)
+    vol_colors = [
+        "#00d4aa" if float(c) >= float(o) else "#ff6b6b"
+        for c, o in zip(df_chart["Close"].squeeze(), df_chart["Open"].squeeze())
+    ]
+    fig.add_trace(go.Bar(
+        x=df_chart.index,
+        y=df_chart["Volume"].squeeze(),
+        marker_color=vol_colors,
+        name="Volume",
+        showlegend=False,
+    ), row=2, col=1)
+
     fig.update_layout(
-        height=320,
+        height=420,
         margin=dict(l=0, r=0, t=10, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0.1)",
-        xaxis=dict(showgrid=False, color="#aaa"),
-        yaxis=dict(showgrid=True, gridcolor="#333", color="#aaa"),
+        xaxis=dict(showgrid=False, color="#aaa", rangeslider_visible=False),
+        xaxis2=dict(showgrid=False, color="#aaa"),
+        yaxis=dict(showgrid=True, gridcolor="#222", color="#aaa"),
+        yaxis2=dict(showgrid=False, color="#aaa", title="Vol"),
         font=dict(color="#ccc"),
-        showlegend=False,
+        legend=dict(orientation="h", x=0, y=1.04, font=dict(size=11)),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -293,8 +374,6 @@ with right:
     st.caption("Enter the strike and Yes price from Robinhood Predict.")
 
     # Preserve user-entered values across auto-refreshes
-    if "strike_val" not in st.session_state:
-        st.session_state["strike_val"] = float(round(current_price, 2))
     if "yes_price_val" not in st.session_state:
         st.session_state["yes_price_val"] = 50
 
@@ -398,7 +477,7 @@ with right:
 
 st.divider()
 st.subheader("Contract Watchlist")
-st.caption(f"Re-evaluated every refresh. Alert fires when edge >= {alert_threshold}%.")
+st.caption(f"Re-evaluated every 10s. Alert fires when edge >= {alert_threshold}%.")
 
 wa, wb, wc = st.columns([3, 1, 1])
 wl_input = wa.text_input("Add contract (strike:yes_price)",
@@ -466,5 +545,5 @@ else:
 # ---------------------------------------------------------------------------
 
 if auto_refresh:
-    time.sleep(30)
+    time.sleep(10)
     st.rerun()
