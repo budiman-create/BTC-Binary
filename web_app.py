@@ -90,15 +90,16 @@ def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: in
 
 with st.sidebar:
     st.title("Settings")
-    symbol    = st.selectbox("Asset", ["BTC", "ETH", "SOL", "DOGE"], index=0)
-    horizon   = st.slider("Contract horizon (min)", 5, 30, 15)
-    bankroll  = st.number_input("Bankroll ($)", min_value=100, value=1000, step=100)
-    vol_window = st.slider("Vol estimation window (min)", 10, 120, 60)
+    symbol       = st.selectbox("Asset", ["BTC", "ETH", "SOL", "DOGE"], index=0)
+    horizon      = st.slider("Contract horizon (min)", 5, 30, 15)
+    bankroll     = st.number_input("Bankroll ($)", min_value=100, value=1000, step=100)
+    vol_window   = st.slider("Vol estimation window (min)", 10, 120, 60)
+    alert_threshold = st.slider("Alert edge threshold (%)", 3, 20, 8)
     auto_refresh = st.checkbox("Auto-refresh every 30s", value=True)
 
     st.divider()
     st.caption("Data: Robinhood (live price) + yfinance (1-min candles)")
-    st.caption("Model: Log-normal GBM, zero drift, realised vol")
+    st.caption("Model: GARCH vol + momentum drift + Student-t tails")
 
 # ---------------------------------------------------------------------------
 # Header
@@ -153,6 +154,49 @@ col6.metric("Momentum", drift_label, delta=drift_delta)
 
 dof_display = f"{tail_dof:.1f}" if tail_dof < 30 else "Normal"
 st.caption(f"Tail model: Student-t dof={dof_display}  |  {'Fatter tails than normal — OTM probabilities boosted' if tail_dof < 15 else 'Near-normal tails'}")
+
+# ---------------------------------------------------------------------------
+# Watchlist — evaluate every refresh, alert if edge crosses threshold
+# ---------------------------------------------------------------------------
+
+from stock_agent.prediction_market import scan_contracts as _scan
+from stock_agent.trading import TradeParams, Signal
+
+if "watchlist" not in st.session_state:
+    st.session_state["watchlist"] = {}
+if "alerted" not in st.session_state:
+    st.session_state["alerted"] = set()
+
+_tp_watch = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
+                        max_position_pct=0.10, min_edge_pct=0.0,
+                        transaction_cost_pct=0.02)
+
+if st.session_state["watchlist"]:
+    watch_decisions = _scan(symbol, current_price, annual_vol,
+                            st.session_state["watchlist"], horizon,
+                            _tp_watch, annual_drift, tail_dof)
+    hot = [d for d in watch_decisions
+           if abs(d.net_edge) >= alert_threshold / 100 and d.signal != Signal.HOLD]
+
+    # Toast only for contracts that newly crossed the threshold this refresh
+    hot_keys = {(d.strike, d.side) for d in hot}
+    for key in hot_keys - st.session_state["alerted"]:
+        d = next(x for x in hot if (x.strike, x.side) == key)
+        act = "BUY YES" if d.signal == Signal.BUY else "BUY NO"
+        st.toast(f"{act}  ${d.strike:,.0f}  edge {d.net_edge:+.1%}", icon="🔔")
+    st.session_state["alerted"] = hot_keys
+
+    if hot:
+        top = hot[0]
+        act = "BUY YES" if top.signal == Signal.BUY else "BUY NO"
+        st.success(
+            f"**ALERT — {act}**  |  Strike ${top.strike:,.2f}  |  "
+            f"Fair {top.fair_prob:.1%}  vs  Market {top.contract_price_pct:.1%}  |  "
+            f"Edge {top.net_edge:+.1%}  |  Size ${top.sized_dollars:,.0f}"
+        )
+else:
+    watch_decisions = []
+    hot = []
 
 st.divider()
 
@@ -347,6 +391,75 @@ with right:
             )
         except Exception as e:
             st.error(f"Parse error: {e}. Use format: 76385:61, 76500:45")
+
+# ---------------------------------------------------------------------------
+# Contract Watchlist (full-width, auto-scanned every refresh)
+# ---------------------------------------------------------------------------
+
+st.divider()
+st.subheader("Contract Watchlist")
+st.caption(f"Re-evaluated every refresh. Alert fires when edge >= {alert_threshold}%.")
+
+wa, wb, wc = st.columns([3, 1, 1])
+wl_input = wa.text_input("Add contract (strike:yes_price)",
+                          placeholder="76385:61",
+                          label_visibility="collapsed",
+                          key="wl_text")
+if wb.button("Add", use_container_width=True) and wl_input:
+    try:
+        k, v = wl_input.strip().split(":")
+        st.session_state["watchlist"][float(k.strip())] = float(v.strip())
+        st.rerun()
+    except Exception:
+        st.error("Format: strike:yes_price  e.g. 76385:61")
+if wc.button("Clear All", use_container_width=True) and st.session_state["watchlist"]:
+    st.session_state["watchlist"] = {}
+    st.session_state["alerted"]   = set()
+    st.rerun()
+
+if watch_decisions:
+    wl_rows = []
+    for d in watch_decisions:
+        orig_price = st.session_state["watchlist"].get(d.strike, 0)
+        wl_rows.append({
+            "Strike":   f"${d.strike:,.2f}",
+            "Yes (c)":  int(orig_price),
+            "Fair":     f"{d.fair_prob:.1%}",
+            "Market":   f"{d.contract_price_pct:.1%}",
+            "Edge":     f"{d.net_edge:+.1%}",
+            "Signal":   d.signal.value,
+            "Action":   (f"BUY {'YES' if d.signal == Signal.BUY else 'NO'}  "
+                         f"${d.sized_dollars:,.0f}") if d.signal != Signal.HOLD else "HOLD",
+        })
+
+    df_watch = pd.DataFrame(wl_rows)
+
+    def _highlight_watch(row):
+        try:
+            edge_val = float(row["Edge"].replace("%", "").replace("+", "")) / 100
+        except ValueError:
+            edge_val = 0.0
+        sig = row["Signal"]
+        is_hot = abs(edge_val) >= alert_threshold / 100
+        if "BUY" in sig and is_hot:
+            return ["background-color: #0a3d20"] * len(row)
+        if "SELL" in sig and is_hot:
+            return ["background-color: #3d0a0a"] * len(row)
+        if "BUY" in sig:
+            return ["background-color: #0d3d2e"] * len(row)
+        if "SELL" in sig:
+            return ["background-color: #3d0d0d"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        df_watch.style.apply(_highlight_watch, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
+elif st.session_state["watchlist"]:
+    st.info("Watchlist loaded — will be evaluated on next refresh.")
+else:
+    st.caption("Add contracts above. They will be auto-scanned every 30 seconds.")
 
 # ---------------------------------------------------------------------------
 # Auto-refresh
