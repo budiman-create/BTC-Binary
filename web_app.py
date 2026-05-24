@@ -57,17 +57,27 @@ def get_live_price(symbol: str):
 
 @st.cache_data(ttl=25)
 def get_intraday(symbol: str, hours: int = 3):
-    from stock_agent.prediction_market import fetch_intraday, realised_vol_annual
+    from stock_agent.prediction_market import (
+        fetch_intraday, realised_vol_annual, garch_vol_annual, estimate_momentum_drift,
+    )
     df = fetch_intraday(symbol, lookback_hours=hours)
-    vol = realised_vol_annual(df, window=60)
-    return df, vol
+    drift = estimate_momentum_drift(df)
+    try:
+        vol = garch_vol_annual(df, window=60)
+        vol_source = "GARCH"
+    except Exception:
+        vol = realised_vol_annual(df, window=60)
+        vol_source = "Realised"
+    return df, vol, drift, vol_source
 
 
 @st.cache_data(ttl=25)
-def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: int):
+def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: int,
+               annual_drift: float = 0.0):
     from stock_agent.prediction_market import probability_ladder, sigma_over_horizon
     rows = probability_ladder(current_price, annual_vol, horizon,
-                              num_strikes=14, pct_range=0.025)
+                              num_strikes=14, pct_range=0.025,
+                              annual_drift=annual_drift)
     sig_T = sigma_over_horizon(annual_vol, horizon)
     return rows, sig_T
 
@@ -108,7 +118,7 @@ if "error" in price_data:
 current_price = price_data["price"]
 
 try:
-    df_intraday, annual_vol = get_intraday(symbol)
+    df_intraday, annual_vol, annual_drift, vol_source = get_intraday(symbol)
 except Exception as e:
     st.error(f"Could not fetch intraday data: {e}")
     st.stop()
@@ -116,16 +126,28 @@ except Exception as e:
 from stock_agent.prediction_market import sigma_over_horizon
 sig_T = sigma_over_horizon(annual_vol, horizon)
 
+# Momentum label for display
+if annual_drift > 5:
+    drift_label = "Bullish"
+    drift_delta = f"+{annual_drift:.1f} drift"
+elif annual_drift < -5:
+    drift_label = "Bearish"
+    drift_delta = f"{annual_drift:.1f} drift"
+else:
+    drift_label = "Neutral"
+    drift_delta = "no signal"
+
 # ---------------------------------------------------------------------------
 # Top metrics row
 # ---------------------------------------------------------------------------
 
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric("BTC Live Price",  f"${current_price:,.2f}")
 col2.metric("Bid",             f"${price_data['bid']:,.2f}" if price_data.get("bid") else "N/A")
 col3.metric("Ask",             f"${price_data['ask']:,.2f}" if price_data.get("ask") else "N/A")
-col4.metric("Intraday Vol",    f"{annual_vol:.1%} p.a.")
+col4.metric(f"Vol ({vol_source})", f"{annual_vol:.1%} p.a.")
 col5.metric(f"{horizon}-min Sigma", f"{sig_T:.3%}")
+col6.metric("Momentum", drift_label, delta=drift_delta)
 
 st.divider()
 
@@ -168,7 +190,7 @@ with left:
 
     # Probability distribution chart
     st.subheader("Fair Probability Distribution")
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon)
+    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift)
     strikes   = [r["strike"] for r in ladder_rows]
     p_yes_vals = [r["fair_yes"] * 100 for r in ladder_rows]
 
@@ -201,7 +223,7 @@ with right:
     st.subheader("Probability Ladder")
     st.caption("Compare these to Robinhood's contract prices to find edge.")
 
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon)
+    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift)
     df_ladder = pd.DataFrame(ladder_rows)
     df_ladder["Strike"]  = df_ladder["strike"].map(lambda x: f"${x:,.2f}")
     df_ladder["P(Yes)"]  = df_ladder["fair_yes"].map(lambda x: f"{x:.1%}")
@@ -245,7 +267,7 @@ with right:
             transaction_cost_pct=0.02,
         )
         d = evaluate_contract(symbol, strike_input, yes_price_input,
-                              current_price, annual_vol, horizon, tp)
+                              current_price, annual_vol, horizon, tp, annual_drift)
 
         # Result card
         if d.signal == Signal.BUY:
@@ -291,7 +313,7 @@ with right:
                 for item in batch_input.split(",")
             }
             decisions = scan_contracts(symbol, current_price, annual_vol,
-                                       contracts, horizon, tp)
+                                       contracts, horizon, tp, annual_drift)
 
             rows = []
             for d in decisions:

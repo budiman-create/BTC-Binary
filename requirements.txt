@@ -6,3 +6,4 @@ ta>=0.11.0
 scipy>=1.12.0
 robin_stocks>=3.0.0
 groq>=1.0.0
+arch>=6.0.0

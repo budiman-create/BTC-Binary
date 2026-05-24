@@ -6,9 +6,9 @@ Models Robinhood Predict-style binary contracts:
 
 Pricing approach:
   - Fetch last 60 minutes of 1-min candles from yfinance for real-time vol
-  - Use log-normal model: P(S_T > K) at T = 15 minutes
-  - BTC trades 24/7 so T = 15 / 525_600 years
-  - At very short horizons drift ≈ 0; vol dominates completely
+  - GARCH(1,1) vol forecast (captures vol clustering); falls back to realised vol
+  - Log-normal GBM with optional momentum drift nudge
+  - 5-min momentum → annualised drift (20% persistence, capped at ±20 p.a.)
   - Compare fair probability to contract price → edge → Kelly size
 
 Key insight: this is IDENTICAL to the soccer Kalshi model — binary contract,
@@ -79,6 +79,45 @@ def realised_vol_annual(df: pd.DataFrame, window: int = VOL_WINDOW) -> float:
     return vol_per_min * math.sqrt(MINUTES_PER_YEAR)
 
 
+def garch_vol_annual(df: pd.DataFrame, window: int = VOL_WINDOW) -> float:
+    """
+    GARCH(1,1) one-step-ahead vol forecast, annualised.
+    Captures vol clustering: recent high vol predicts near-future high vol.
+    Requires the `arch` package (pip install arch).
+    """
+    from arch import arch_model  # optional dependency
+    log_ret = np.log(df["Close"] / df["Close"].shift(1)).dropna()
+    recent  = log_ret.tail(window)
+    if len(recent) < 20:
+        raise ValueError("Need >= 20 observations for GARCH.")
+    pct = recent * 100  # arch library expects percentage returns
+    model = arch_model(pct, vol="Garch", p=1, q=1, dist="Normal", rescale=False)
+    fit   = model.fit(disp="off", show_warning=False)
+    forecast     = fit.forecast(horizon=1, reindex=False)
+    var_pct_sq   = float(forecast.variance.iloc[-1, 0])   # in (%²)
+    vol_per_min  = math.sqrt(var_pct_sq) / 100.0
+    return vol_per_min * math.sqrt(MINUTES_PER_YEAR)
+
+
+def estimate_momentum_drift(df: pd.DataFrame, lookback_min: int = 5) -> float:
+    """
+    Convert 5-min realised return into an annualised drift nudge.
+
+    Crypto momentum has ~20% persistence — it fades fast.
+    Cap at ±20 annualised, which shifts ATM probability by at most ~8%.
+    Returns 0.0 for moves below 0.1% (noise threshold).
+    """
+    recent = df["Close"].tail(lookback_min + 1)
+    if len(recent) < 2:
+        return 0.0
+    r = float(math.log(float(recent.iloc[-1]) / float(recent.iloc[0])))
+    if abs(r) < 0.001:          # sub-0.1% move — treat as noise
+        return 0.0
+    T_window = lookback_min / MINUTES_PER_YEAR
+    annual   = (r / T_window) * 0.20    # 20% persistence factor
+    return float(max(-20.0, min(20.0, annual)))
+
+
 def sigma_over_horizon(annual_vol: float, horizon_minutes: int = DEFAULT_HORIZON) -> float:
     """Vol scaled to the prediction window."""
     T = horizon_minutes / MINUTES_PER_YEAR
@@ -94,19 +133,20 @@ def fair_prob_yes(
     strike: float,
     annual_vol: float,
     horizon_minutes: int = DEFAULT_HORIZON,
+    annual_drift: float = 0.0,
 ) -> float:
     """
     P(BTC > strike in `horizon_minutes`) under log-normal GBM.
-    Drift is set to zero — at 15 min it is negligible vs vol.
+
+    annual_drift: annualised continuous drift (from momentum signal).
+                  Zero means pure vol-driven (original behaviour).
+    Formula: P(S_T > K) = norm.sf( (ln(K/S0) + 0.5*sigma_T^2 - mu*T) / sigma_T )
     """
     T       = horizon_minutes / MINUTES_PER_YEAR
     sigma_T = annual_vol * math.sqrt(T)
     if sigma_T <= 0:
         return 1.0 if current_price > strike else 0.0
-    # log-normal: P(S_T > K) = N( (ln(S0/K) + 0.5*sigma_T^2) / sigma_T )
-    # With zero drift, mu_T = -0.5*sigma^2*T so:
-    # x = (ln(K/S0) - mu_T) / sigma_T = (ln(K/S0) + 0.5*sigma_T^2) / sigma_T
-    x = (math.log(strike / current_price) + 0.5 * sigma_T ** 2) / sigma_T
+    x = (math.log(strike / current_price) + 0.5 * sigma_T ** 2 - annual_drift * T) / sigma_T
     return float(norm.sf(x))
 
 
@@ -115,8 +155,9 @@ def fair_prob_no(
     strike: float,
     annual_vol: float,
     horizon_minutes: int = DEFAULT_HORIZON,
+    annual_drift: float = 0.0,
 ) -> float:
-    return 1.0 - fair_prob_yes(current_price, strike, annual_vol, horizon_minutes)
+    return 1.0 - fair_prob_yes(current_price, strike, annual_vol, horizon_minutes, annual_drift)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +169,8 @@ def probability_ladder(
     annual_vol: float,
     horizon_minutes: int = DEFAULT_HORIZON,
     num_strikes: int = 10,
-    pct_range: float = 0.03,      # ±3% from current price
+    pct_range: float = 0.03,
+    annual_drift: float = 0.0,
 ) -> list[dict]:
     """
     Generate a table of fair probabilities at strikes around the current price.
@@ -136,13 +178,13 @@ def probability_ladder(
     """
     sig_T = sigma_over_horizon(annual_vol, horizon_minutes)
 
-    low    = current_price * (1 - pct_range)
-    high   = current_price * (1 + pct_range)
+    low     = current_price * (1 - pct_range)
+    high    = current_price * (1 + pct_range)
     strikes = [low + (high - low) * i / (num_strikes - 1) for i in range(num_strikes)]
 
     rows = []
     for k in strikes:
-        p_yes = fair_prob_yes(current_price, k, annual_vol, horizon_minutes)
+        p_yes = fair_prob_yes(current_price, k, annual_vol, horizon_minutes, annual_drift)
         rows.append({
             "strike":   round(k, 2),
             "fair_yes": p_yes,
@@ -188,14 +230,16 @@ def evaluate_contract(
     annual_vol: float,
     horizon_minutes: int = DEFAULT_HORIZON,
     params: TradeParams = TradeParams(),
+    annual_drift: float = 0.0,
 ) -> ContractDecision:
     """
     Evaluate one Yes/No binary contract.
 
     contract_yes_price: the price shown on Robinhood in cents, e.g. 45 means
                         the market thinks there's a 45% chance BTC ends above strike.
+    annual_drift: momentum-derived drift from estimate_momentum_drift().
     """
-    fair   = fair_prob_yes(current_price, strike, annual_vol, horizon_minutes)
+    fair   = fair_prob_yes(current_price, strike, annual_vol, horizon_minutes, annual_drift)
     mkt    = contract_yes_price / 100.0
     sig_T  = sigma_over_horizon(annual_vol, horizon_minutes)
 
@@ -250,6 +294,7 @@ def scan_contracts(
     contracts: dict[float, float],     # {strike: yes_price_in_cents}
     horizon_minutes: int = DEFAULT_HORIZON,
     params: TradeParams = TradeParams(),
+    annual_drift: float = 0.0,
 ) -> list[ContractDecision]:
     """
     Evaluate a batch of contracts. Pass all the Yes prices you see on Robinhood.
@@ -257,7 +302,7 @@ def scan_contracts(
     """
     decisions = [
         evaluate_contract(symbol, strike, yes_price, current_price,
-                          annual_vol, horizon_minutes, params)
+                          annual_vol, horizon_minutes, params, annual_drift)
         for strike, yes_price in contracts.items()
     ]
     decisions.sort(key=lambda d: abs(d.net_edge), reverse=True)

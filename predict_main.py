@@ -36,8 +36,10 @@ from stock_agent.prediction_market import (
     DEFAULT_HORIZON,
     VOL_WINDOW,
     evaluate_contract,
+    estimate_momentum_drift,
     fetch_intraday,
     fair_prob_yes,
+    garch_vol_annual,
     probability_ladder,
     realised_vol_annual,
     scan_contracts,
@@ -64,9 +66,11 @@ def _print_ladder(
     current_price: float,
     annual_vol: float,
     horizon: int,
+    annual_drift: float = 0.0,
 ) -> None:
     sig_T = sigma_over_horizon(annual_vol, horizon)
-    rows  = probability_ladder(current_price, annual_vol, horizon, num_strikes=12, pct_range=0.025)
+    rows  = probability_ladder(current_price, annual_vol, horizon, num_strikes=12,
+                               pct_range=0.025, annual_drift=annual_drift)
 
     print(f"\n{'='*65}")
     print(f"  {symbol} PREDICTION MARKET - PROBABILITY LADDER")
@@ -138,13 +142,26 @@ def run(
         print(f"  yfinance price: ${current_price:,.4f}")
 
     # ------------------------------------------------------------------
-    # 2. Intraday volatility from 1-min data
+    # 2. Intraday volatility (GARCH preferred) + momentum drift
     # ------------------------------------------------------------------
     print(f"  Fetching {vol_window}-min intraday vol ...")
     df = fetch_intraday(symbol, lookback_hours=max(3, vol_window // 60 + 1))
-    annual_vol = realised_vol_annual(df, window=vol_window)
-    sig_T = sigma_over_horizon(annual_vol, horizon)
-    print(f"  Intraday vol : {annual_vol:.1%} p.a.  ({horizon}-min sigma: {sig_T:.3%})")
+
+    realised = realised_vol_annual(df, window=vol_window)
+    try:
+        annual_vol = garch_vol_annual(df, window=vol_window)
+        vol_label  = "GARCH(1,1)"
+        print(f"  GARCH vol    : {annual_vol:.1%} p.a.  (realised: {realised:.1%})")
+    except Exception as e:
+        annual_vol = realised
+        vol_label  = "Realised"
+        print(f"  Realised vol : {annual_vol:.1%} p.a.  (GARCH unavailable: {e})")
+
+    sig_T        = sigma_over_horizon(annual_vol, horizon)
+    annual_drift = estimate_momentum_drift(df)
+    drift_T      = annual_drift * (horizon / 525_600)
+    print(f"  {horizon}-min sigma : {sig_T:.3%}  |  vol source: {vol_label}")
+    print(f"  Momentum drift: {annual_drift:+.2f} p.a.  ({drift_T:+.4%} over {horizon} min)")
 
     # ------------------------------------------------------------------
     # 3. Run requested mode
@@ -165,18 +182,18 @@ def run(
             k, v = item.strip().split(":")
             contracts[float(k.strip())] = float(v.strip())
         decisions = scan_contracts(symbol, current_price, annual_vol,
-                                   contracts, horizon, tp)
+                                   contracts, horizon, tp, annual_drift)
         _print_decisions(decisions, bankroll)
 
     elif strike is not None and yes_price is not None:
         # CONTRACT MODE: single contract
         d = evaluate_contract(symbol, strike, yes_price, current_price,
-                              annual_vol, horizon, tp)
+                              annual_vol, horizon, tp, annual_drift)
         _print_decisions([d], bankroll)
 
     else:
         # LADDER MODE: show probability table
-        _print_ladder(symbol, current_price, annual_vol, horizon)
+        _print_ladder(symbol, current_price, annual_vol, horizon, annual_drift)
         print("  Tip: once you see prices on Robinhood, run:")
         print(f"  python predict_main.py {symbol} --contracts \"STRIKE:YES_PRICE,...\"")
         print()
