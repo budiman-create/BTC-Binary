@@ -221,11 +221,17 @@ with right:
     st.subheader("Evaluate a Contract")
     st.caption("Enter the strike and Yes price from Robinhood Predict.")
 
+    # Preserve user-entered values across auto-refreshes
+    if "strike_val" not in st.session_state:
+        st.session_state["strike_val"] = float(round(current_price, 2))
+    if "yes_price_val" not in st.session_state:
+        st.session_state["yes_price_val"] = 50
+
     c1, c2 = st.columns(2)
-    strike_input    = c1.number_input("Strike price ($)", value=float(round(current_price, 2)),
-                                       step=0.01, format="%.2f")
+    strike_input    = c1.number_input("Strike price ($)", step=0.01, format="%.2f",
+                                       key="strike_val")
     yes_price_input = c2.number_input("Yes price (cents)", min_value=1, max_value=99,
-                                       value=50, step=1)
+                                       step=1, key="yes_price_val")
 
     if st.button("Analyze Contract", type="primary", use_container_width=True):
         from stock_agent.prediction_market import evaluate_contract
