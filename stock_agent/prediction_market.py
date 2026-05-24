@@ -118,6 +118,28 @@ def estimate_momentum_drift(df: pd.DataFrame, lookback_min: int = 5) -> float:
     return float(max(-20.0, min(20.0, annual)))
 
 
+def estimate_tail_dof(df: pd.DataFrame, window: int = VOL_WINDOW) -> float:
+    """
+    Estimate Student-t degrees of freedom from recent log-return kurtosis.
+
+    BTC returns are fat-tailed (excess kurtosis 3-8), meaning the normal
+    distribution underestimates the probability of extreme moves.
+    Lower dof = fatter tails (BTC typically lands around 4-6).
+    Returns a value in [3, 30]; at 30 the t-distribution is ~normal.
+
+    Method of moments: excess_kurtosis = 6 / (dof - 4)  →  dof = 6/k + 4
+    """
+    log_ret = np.log(df["Close"] / df["Close"].shift(1)).dropna()
+    recent  = log_ret.tail(window)
+    if len(recent) < 20:
+        return 5.0          # fallback: moderately fat tails
+    excess_kurt = float(recent.kurtosis())   # pandas returns excess kurtosis
+    if excess_kurt <= 0:
+        return 30.0         # thin/normal tails
+    dof = 6.0 / excess_kurt + 4.0
+    return float(max(3.0, min(30.0, dof)))
+
+
 def sigma_over_horizon(annual_vol: float, horizon_minutes: int = DEFAULT_HORIZON) -> float:
     """Vol scaled to the prediction window."""
     T = horizon_minutes / MINUTES_PER_YEAR
@@ -134,20 +156,25 @@ def fair_prob_yes(
     annual_vol: float,
     horizon_minutes: int = DEFAULT_HORIZON,
     annual_drift: float = 0.0,
+    tail_dof: float = 30.0,
 ) -> float:
     """
     P(BTC > strike in `horizon_minutes`) under log-normal GBM.
 
-    annual_drift: annualised continuous drift (from momentum signal).
-                  Zero means pure vol-driven (original behaviour).
-    Formula: P(S_T > K) = norm.sf( (ln(K/S0) + 0.5*sigma_T^2 - mu*T) / sigma_T )
+    tail_dof: Student-t degrees of freedom for fat-tail correction.
+              30+ → standard normal (no correction).
+              4-6 → BTC-typical fat tails; raises OTM probabilities.
+    Formula: P(S_T > K) = t.sf( (ln(K/S0) + 0.5*sigma_T^2 - mu*T) / sigma_T, df=tail_dof )
     """
+    from scipy.stats import t as t_dist
     T       = horizon_minutes / MINUTES_PER_YEAR
     sigma_T = annual_vol * math.sqrt(T)
     if sigma_T <= 0:
         return 1.0 if current_price > strike else 0.0
     x = (math.log(strike / current_price) + 0.5 * sigma_T ** 2 - annual_drift * T) / sigma_T
-    return float(norm.sf(x))
+    if tail_dof >= 30.0:
+        return float(norm.sf(x))
+    return float(t_dist.sf(x, df=tail_dof))
 
 
 def fair_prob_no(
@@ -156,8 +183,10 @@ def fair_prob_no(
     annual_vol: float,
     horizon_minutes: int = DEFAULT_HORIZON,
     annual_drift: float = 0.0,
+    tail_dof: float = 30.0,
 ) -> float:
-    return 1.0 - fair_prob_yes(current_price, strike, annual_vol, horizon_minutes, annual_drift)
+    return 1.0 - fair_prob_yes(current_price, strike, annual_vol,
+                               horizon_minutes, annual_drift, tail_dof)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +200,7 @@ def probability_ladder(
     num_strikes: int = 10,
     pct_range: float = 0.03,
     annual_drift: float = 0.0,
+    tail_dof: float = 30.0,
 ) -> list[dict]:
     """
     Generate a table of fair probabilities at strikes around the current price.
@@ -184,7 +214,8 @@ def probability_ladder(
 
     rows = []
     for k in strikes:
-        p_yes = fair_prob_yes(current_price, k, annual_vol, horizon_minutes, annual_drift)
+        p_yes = fair_prob_yes(current_price, k, annual_vol, horizon_minutes,
+                              annual_drift, tail_dof)
         rows.append({
             "strike":   round(k, 2),
             "fair_yes": p_yes,
@@ -231,6 +262,7 @@ def evaluate_contract(
     horizon_minutes: int = DEFAULT_HORIZON,
     params: TradeParams = TradeParams(),
     annual_drift: float = 0.0,
+    tail_dof: float = 30.0,
 ) -> ContractDecision:
     """
     Evaluate one Yes/No binary contract.
@@ -238,8 +270,10 @@ def evaluate_contract(
     contract_yes_price: the price shown on Robinhood in cents, e.g. 45 means
                         the market thinks there's a 45% chance BTC ends above strike.
     annual_drift: momentum-derived drift from estimate_momentum_drift().
+    tail_dof: Student-t dof from estimate_tail_dof(); corrects for fat tails.
     """
-    fair   = fair_prob_yes(current_price, strike, annual_vol, horizon_minutes, annual_drift)
+    fair   = fair_prob_yes(current_price, strike, annual_vol, horizon_minutes,
+                           annual_drift, tail_dof)
     mkt    = contract_yes_price / 100.0
     sig_T  = sigma_over_horizon(annual_vol, horizon_minutes)
 
@@ -295,6 +329,7 @@ def scan_contracts(
     horizon_minutes: int = DEFAULT_HORIZON,
     params: TradeParams = TradeParams(),
     annual_drift: float = 0.0,
+    tail_dof: float = 30.0,
 ) -> list[ContractDecision]:
     """
     Evaluate a batch of contracts. Pass all the Yes prices you see on Robinhood.
@@ -302,7 +337,7 @@ def scan_contracts(
     """
     decisions = [
         evaluate_contract(symbol, strike, yes_price, current_price,
-                          annual_vol, horizon_minutes, params, annual_drift)
+                          annual_vol, horizon_minutes, params, annual_drift, tail_dof)
         for strike, yes_price in contracts.items()
     ]
     decisions.sort(key=lambda d: abs(d.net_edge), reverse=True)

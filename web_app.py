@@ -58,26 +58,28 @@ def get_live_price(symbol: str):
 @st.cache_data(ttl=25)
 def get_intraday(symbol: str, hours: int = 3):
     from stock_agent.prediction_market import (
-        fetch_intraday, realised_vol_annual, garch_vol_annual, estimate_momentum_drift,
+        fetch_intraday, realised_vol_annual, garch_vol_annual,
+        estimate_momentum_drift, estimate_tail_dof,
     )
     df = fetch_intraday(symbol, lookback_hours=hours)
-    drift = estimate_momentum_drift(df)
+    drift   = estimate_momentum_drift(df)
+    tail_dof = estimate_tail_dof(df)
     try:
         vol = garch_vol_annual(df, window=60)
         vol_source = "GARCH"
     except Exception:
         vol = realised_vol_annual(df, window=60)
         vol_source = "Realised"
-    return df, vol, drift, vol_source
+    return df, vol, drift, vol_source, tail_dof
 
 
 @st.cache_data(ttl=25)
 def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: int,
-               annual_drift: float = 0.0):
+               annual_drift: float = 0.0, tail_dof: float = 30.0):
     from stock_agent.prediction_market import probability_ladder, sigma_over_horizon
     rows = probability_ladder(current_price, annual_vol, horizon,
                               num_strikes=14, pct_range=0.025,
-                              annual_drift=annual_drift)
+                              annual_drift=annual_drift, tail_dof=tail_dof)
     sig_T = sigma_over_horizon(annual_vol, horizon)
     return rows, sig_T
 
@@ -118,7 +120,7 @@ if "error" in price_data:
 current_price = price_data["price"]
 
 try:
-    df_intraday, annual_vol, annual_drift, vol_source = get_intraday(symbol)
+    df_intraday, annual_vol, annual_drift, vol_source, tail_dof = get_intraday(symbol)
 except Exception as e:
     st.error(f"Could not fetch intraday data: {e}")
     st.stop()
@@ -148,6 +150,9 @@ col3.metric("Ask",             f"${price_data['ask']:,.2f}" if price_data.get("a
 col4.metric(f"Vol ({vol_source})", f"{annual_vol:.1%} p.a.")
 col5.metric(f"{horizon}-min Sigma", f"{sig_T:.3%}")
 col6.metric("Momentum", drift_label, delta=drift_delta)
+
+dof_display = f"{tail_dof:.1f}" if tail_dof < 30 else "Normal"
+st.caption(f"Tail model: Student-t dof={dof_display}  |  {'Fatter tails than normal — OTM probabilities boosted' if tail_dof < 15 else 'Near-normal tails'}")
 
 st.divider()
 
@@ -190,7 +195,7 @@ with left:
 
     # Probability distribution chart
     st.subheader("Fair Probability Distribution")
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift)
+    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift, tail_dof)
     strikes   = [r["strike"] for r in ladder_rows]
     p_yes_vals = [r["fair_yes"] * 100 for r in ladder_rows]
 
@@ -223,7 +228,7 @@ with right:
     st.subheader("Probability Ladder")
     st.caption("Compare these to Robinhood's contract prices to find edge.")
 
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift)
+    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift, tail_dof)
     df_ladder = pd.DataFrame(ladder_rows)
     df_ladder["Strike"]  = df_ladder["strike"].map(lambda x: f"${x:,.2f}")
     df_ladder["P(Yes)"]  = df_ladder["fair_yes"].map(lambda x: f"{x:.1%}")
@@ -267,7 +272,7 @@ with right:
             transaction_cost_pct=0.02,
         )
         d = evaluate_contract(symbol, strike_input, yes_price_input,
-                              current_price, annual_vol, horizon, tp, annual_drift)
+                              current_price, annual_vol, horizon, tp, annual_drift, tail_dof)
 
         # Result card
         if d.signal == Signal.BUY:
@@ -313,7 +318,7 @@ with right:
                 for item in batch_input.split(",")
             }
             decisions = scan_contracts(symbol, current_price, annual_vol,
-                                       contracts, horizon, tp, annual_drift)
+                                       contracts, horizon, tp, annual_drift, tail_dof)
 
             rows = []
             for d in decisions:

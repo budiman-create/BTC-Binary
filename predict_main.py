@@ -37,6 +37,7 @@ from stock_agent.prediction_market import (
     VOL_WINDOW,
     evaluate_contract,
     estimate_momentum_drift,
+    estimate_tail_dof,
     fetch_intraday,
     fair_prob_yes,
     garch_vol_annual,
@@ -67,10 +68,12 @@ def _print_ladder(
     annual_vol: float,
     horizon: int,
     annual_drift: float = 0.0,
+    tail_dof: float = 30.0,
 ) -> None:
     sig_T = sigma_over_horizon(annual_vol, horizon)
     rows  = probability_ladder(current_price, annual_vol, horizon, num_strikes=12,
-                               pct_range=0.025, annual_drift=annual_drift)
+                               pct_range=0.025, annual_drift=annual_drift,
+                               tail_dof=tail_dof)
 
     print(f"\n{'='*65}")
     print(f"  {symbol} PREDICTION MARKET - PROBABILITY LADDER")
@@ -159,9 +162,12 @@ def run(
 
     sig_T        = sigma_over_horizon(annual_vol, horizon)
     annual_drift = estimate_momentum_drift(df)
+    tail_dof     = estimate_tail_dof(df)
     drift_T      = annual_drift * (horizon / 525_600)
     print(f"  {horizon}-min sigma : {sig_T:.3%}  |  vol source: {vol_label}")
     print(f"  Momentum drift: {annual_drift:+.2f} p.a.  ({drift_T:+.4%} over {horizon} min)")
+    tail_str = f"{tail_dof:.1f}" if tail_dof < 30 else "normal (>=30)"
+    print(f"  Tail dof      : {tail_str}  ({'fat tails — OTM probs boosted' if tail_dof < 15 else 'near-normal'})")
 
     # ------------------------------------------------------------------
     # 3. Run requested mode
@@ -182,18 +188,18 @@ def run(
             k, v = item.strip().split(":")
             contracts[float(k.strip())] = float(v.strip())
         decisions = scan_contracts(symbol, current_price, annual_vol,
-                                   contracts, horizon, tp, annual_drift)
+                                   contracts, horizon, tp, annual_drift, tail_dof)
         _print_decisions(decisions, bankroll)
 
     elif strike is not None and yes_price is not None:
         # CONTRACT MODE: single contract
         d = evaluate_contract(symbol, strike, yes_price, current_price,
-                              annual_vol, horizon, tp, annual_drift)
+                              annual_vol, horizon, tp, annual_drift, tail_dof)
         _print_decisions([d], bankroll)
 
     else:
         # LADDER MODE: show probability table
-        _print_ladder(symbol, current_price, annual_vol, horizon, annual_drift)
+        _print_ladder(symbol, current_price, annual_vol, horizon, annual_drift, tail_dof)
         print("  Tip: once you see prices on Robinhood, run:")
         print(f"  python predict_main.py {symbol} --contracts \"STRIKE:YES_PRICE,...\"")
         print()
