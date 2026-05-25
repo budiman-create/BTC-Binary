@@ -273,8 +273,28 @@ try:
 except Exception:
     _history_context = ""
 
+# ---------------------------------------------------------------------------
+# Auto-load KXBTCD contracts for the next expiry hour (ET = UTC-4 approx)
+# ---------------------------------------------------------------------------
+import datetime as _dt
+
+_now_et   = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=4)
+# Next full hour: if it's 15:10 → 16, if it's 16:00 exactly → 17 (that contract just expired)
+_next_hour_et = (_now_et.hour + 1) % 24
+
 if "kxbtcd_markets" not in st.session_state:
     st.session_state["kxbtcd_markets"] = []
+
+# Fire auto-load whenever the target hour changes (rolls over each hour)
+if st.session_state.get("kxbtcd_auto_hour") != _next_hour_et:
+    try:
+        from stock_agent.kalshi_market import find_kxbtcd_atm_markets
+        _auto_mkts = find_kxbtcd_atm_markets(current_price, hour_et=_next_hour_et)
+        if _auto_mkts:
+            st.session_state["kxbtcd_markets"]  = _auto_mkts
+            st.session_state["kxbtcd_auto_hour"] = _next_hour_et
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Pre-compute KXBTCD contract evaluations (used by both right column + AI)
@@ -599,15 +619,22 @@ with right:
     st.subheader("Evaluate Kalshi")
 
     # -- KXBTCD hourly event (fastest path for 1-hour trading) ---------------
-    st.caption("**Quick: KXBTCD hourly event** — fetches all near-ATM strikes for a specific hour")
+    _loaded_hour = st.session_state.get("kxbtcd_auto_hour", _next_hour_et)
+    st.caption(
+        f"**KXBTCD hourly event** — auto-loaded for **{_loaded_hour:02d}:00 ET** "
+        f"(now {_now_et.strftime('%H:%M')} ET)"
+    )
     kx_col1, kx_col2 = st.columns([1, 2])
-    kxbtcd_hour = kx_col1.number_input("Expiry hour (ET, 24h)", min_value=0, max_value=23, value=11)
-    if kx_col2.button("Load KXBTCD ATM Contracts", use_container_width=True):
+    kxbtcd_hour = kx_col1.number_input(
+        "Override hour (ET)", min_value=0, max_value=23, value=_next_hour_et
+    )
+    if kx_col2.button("Reload", use_container_width=True):
         try:
             from stock_agent.kalshi_market import find_kxbtcd_atm_markets
-            st.session_state["kxbtcd_markets"] = find_kxbtcd_atm_markets(
+            st.session_state["kxbtcd_markets"]  = find_kxbtcd_atm_markets(
                 current_price, hour_et=kxbtcd_hour
             )
+            st.session_state["kxbtcd_auto_hour"] = kxbtcd_hour
             if not st.session_state["kxbtcd_markets"]:
                 st.warning(f"No open KXBTCD markets found for {kxbtcd_hour:02d}:00 ET today.")
         except Exception as e:
