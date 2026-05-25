@@ -266,7 +266,7 @@ st.caption(
 try:
     from stock_agent.trade_log import check_and_mark_outcomes, build_history_context
     check_and_mark_outcomes()
-    _history_context = build_history_context(n=10)
+    _history_context = build_history_context(n=25)
 except Exception:
     _history_context = ""
 
@@ -512,17 +512,18 @@ with left:
             else:
                 st.info(f"**AI: {report.contract_action}**")
 
-        # Log button — pick the contract with highest absolute edge that has a BUY signal
+        # Auto-log the AI recommendation once per unique (ticker + action) combination.
+        # Session state fingerprint prevents duplicate rows on every 60s refresh.
         _best_contract = next(
             (r for r in sorted(_kx_evaluated, key=lambda r: abs(r["edge_pct"]), reverse=True)
              if r["action"] in ("BUY YES", "BUY NO")),
             None,
         )
         if _best_contract and report.contract_action and not report.contract_action.upper().startswith("SKIP"):
-            if st.button("Log AI Recommendation", type="primary", use_container_width=True):
+            _log_fingerprint = f"{_best_contract['ticker']}|{report.contract_action[:50]}"
+            if st.session_state.get("last_log_fingerprint") != _log_fingerprint:
                 try:
                     from stock_agent.trade_log import log_recommendation
-                    # minutes_left may be stored as "?" string — coerce to float or None
                     _ml_raw = _best_contract.get("minutes_left")
                     try:
                         _ml = float(_ml_raw) if _ml_raw not in (None, "?", "") else None
@@ -545,9 +546,12 @@ with left:
                         minutes_left=_ml,
                         btc_price=current_price,
                     )
-                    st.success(f"Logged {_best_contract['ticker']} — id: {_row_id}")
+                    st.session_state["last_log_fingerprint"] = _log_fingerprint
+                    st.info(f"Auto-logged: {_best_contract['ticker']} — {report.contract_action[:40]}")
                 except Exception as _log_err:
-                    st.error(f"Log failed: {_log_err}")
+                    st.warning(f"Auto-log failed: {_log_err}")
+            else:
+                st.caption(f"Already logged: {_best_contract['ticker']} — waiting for AI change or new contract")
 
         with st.expander("Analyst report", expanded=False):
             st.write(f"**Trend:** {report.fundamental_summary}")
@@ -646,7 +650,7 @@ try:
         )
         stat_c4.metric("Avg Edge (correct trades)", avg_edge_c)
 
-    history_rows = get_recent_history(n=20)
+    history_rows = get_recent_history(n=30)
     if history_rows:
         def _fmt_bool(val: str) -> str:
             if val in ("True", "true", "1"):
