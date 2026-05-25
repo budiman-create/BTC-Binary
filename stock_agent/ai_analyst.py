@@ -309,21 +309,33 @@ def analyse_btc(
         extra_context, contracts_context, history_context,
     )
 
-    client = Groq(api_key=key)
-    response = client.chat.completions.create(
-        model=model,
-        max_tokens=600,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a concise, data-driven crypto analyst specialising in "
-                    "short-term binary contract pricing. Follow the exact output format. "
-                    "No markdown, no preamble. Be specific about what the live news implies."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+    system_msg = (
+        "You are a concise, data-driven crypto analyst specialising in "
+        "short-term binary contract pricing. Follow the exact output format. "
+        "No markdown, no preamble. Be specific about what the live news implies."
     )
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user",   "content": prompt},
+    ]
+
+    # Fallback chain: primary model -> fast/cheap model on 429
+    _FALLBACK_MODEL = "llama-3.1-8b-instant"
+    client = Groq(api_key=key)
+
+    try:
+        response = client.chat.completions.create(
+            model=model, max_tokens=450, messages=messages,
+        )
+    except Exception as primary_err:
+        err_str = str(primary_err)
+        if "429" in err_str and model != _FALLBACK_MODEL:
+            # Rate-limited on primary — retry with fast small model
+            response = client.chat.completions.create(
+                model=_FALLBACK_MODEL, max_tokens=450, messages=messages,
+            )
+        else:
+            raise
+
     raw = response.choices[0].message.content
     return _parse_response(symbol, raw), raw_news

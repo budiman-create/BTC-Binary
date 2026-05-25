@@ -109,7 +109,7 @@ def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: in
 
 
 
-@st.cache_data(ttl=180)   # refresh every 3 min — news doesn't change every second
+@st.cache_data(ttl=600)   # 10 min — conserves Groq free-tier token quota (100k/day)
 def get_ai_analysis(
     symbol: str,
     current_price: float,
@@ -464,7 +464,7 @@ with left:
 
     # -- AI Analysis ----------------------------------------------------------
     st.subheader("AI Analysis (Groq + Live News)")
-    st.caption("Llama-3.3-70b reads Fear & Greed + CryptoPanic headlines — refreshes every 3 min")
+    st.caption("Llama-3.3-70b reads Fear & Greed + CryptoPanic headlines — refreshes every 10 min (auto-fallback to 8b-instant on rate limit)")
 
     report, raw_news, ai_error = get_ai_analysis(
         symbol, current_price, annual_vol, annual_drift,
