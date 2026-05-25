@@ -134,12 +134,6 @@ def get_kalshi_btc_markets(max_expiry_hours: float | None = None):
     return find_btc_markets(max_expiry_hours=max_expiry_hours)
 
 
-@st.cache_data(ttl=8)
-def get_kalshi_btc_quotes(markets: list[dict]):
-    from stock_agent.kalshi_market import attach_orderbook_quotes
-
-    return attach_orderbook_quotes(markets)
-
 
 # ---------------------------------------------------------------------------
 # Sidebar — settings
@@ -152,7 +146,6 @@ with st.sidebar:
     horizon      = st.slider("Contract horizon (min)", 15, 240, 60)
     bankroll     = st.number_input("Bankroll ($)", min_value=100, value=1000, step=100)
     vol_window   = st.slider("Vol estimation window (hourly candles)", 24, 120, 60)
-    alert_threshold = st.slider("Alert edge threshold (%)", 3, 20, 8)
     auto_refresh = st.checkbox("Auto-refresh every 30s", value=True)
 
     st.divider()
@@ -195,10 +188,6 @@ annual_drift = annual_drift * 0.75 + funding_drift * 0.25
 
 from stock_agent.prediction_market import sigma_over_horizon
 sig_T = sigma_over_horizon(annual_vol, horizon)
-
-# Initialize strike early so the chart can use it before the right column renders
-if "strike_val" not in st.session_state:
-    st.session_state["strike_val"] = float(round(current_price, 2))
 
 # Momentum label — driven by chart signal now
 ema_cross = signal_details["ema_cross"]
@@ -253,50 +242,8 @@ st.caption(
     f"Funding drift: {funding_drift:+.1f}  |  Blended drift: {annual_drift:+.1f}"
 )
 
-# ---------------------------------------------------------------------------
-# Watchlist — evaluate every refresh, alert if edge crosses threshold
-# ---------------------------------------------------------------------------
-
-from stock_agent.prediction_market import scan_contracts as _scan
-from stock_agent.trading import TradeParams, Signal
-
-if "watchlist" not in st.session_state:
-    st.session_state["watchlist"] = {}
-if "alerted" not in st.session_state:
-    st.session_state["alerted"] = set()
 if "kxbtcd_markets" not in st.session_state:
     st.session_state["kxbtcd_markets"] = []
-
-_tp_watch = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
-                        max_position_pct=0.10, min_edge_pct=0.0,
-                        transaction_cost_pct=0.02)
-
-if st.session_state["watchlist"]:
-    watch_decisions = _scan(symbol, current_price, annual_vol,
-                            st.session_state["watchlist"], horizon,
-                            _tp_watch, annual_drift, tail_dof, calibration)
-    hot = [d for d in watch_decisions
-           if abs(d.net_edge) >= alert_threshold / 100 and d.signal != Signal.HOLD]
-
-    # Toast only for contracts that newly crossed the threshold this refresh
-    hot_keys = {(d.strike, d.side) for d in hot}
-    for key in hot_keys - st.session_state["alerted"]:
-        d = next(x for x in hot if (x.strike, x.side) == key)
-        act = "BUY YES" if d.signal == Signal.BUY else "BUY NO"
-        st.toast(f"{act}  ${d.strike:,.0f}  edge {d.net_edge:+.1%}", icon="🔔")
-    st.session_state["alerted"] = hot_keys
-
-    if hot:
-        top = hot[0]
-        act = "BUY YES" if top.signal == Signal.BUY else "BUY NO"
-        st.success(
-            f"**ALERT — {act}**  |  Strike ${top.strike:,.2f}  |  "
-            f"Cal {top.fair_prob:.1%}  vs  Market {top.contract_price_pct:.1%}  |  "
-            f"Edge {top.net_edge:+.1%}  |  Size ${top.sized_dollars:,.0f}"
-        )
-else:
-    watch_decisions = []
-    hot = []
 
 st.divider()
 
@@ -362,18 +309,6 @@ with left:
         annotation_position="top right",
         row=1, col=1,
     )
-
-    # Strike price line (from contract evaluator)
-    strike_val = st.session_state.get("strike_val")
-    if strike_val and abs(strike_val - current_price) / current_price > 0.0001:
-        fig.add_hline(
-            y=strike_val,
-            line_dash="dash",
-            line_color="#a78bfa",
-            annotation_text=f"Strike ${strike_val:,.2f}",
-            annotation_position="bottom right",
-            row=1, col=1,
-        )
 
     # Volume bars (green if candle up, red if down)
     vol_colors = [
@@ -455,57 +390,6 @@ with right:
         hide_index=True,
         height=350,
     )
-
-    st.divider()
-    st.subheader("Evaluate a Contract")
-    st.caption("Enter the strike and Yes price from Robinhood Predict.")
-
-    # Preserve user-entered values across auto-refreshes
-    if "yes_price_val" not in st.session_state:
-        st.session_state["yes_price_val"] = 50
-
-    c1, c2 = st.columns(2)
-    strike_input    = c1.number_input("Strike price ($)", step=0.01, format="%.2f",
-                                       key="strike_val")
-    yes_price_input = c2.number_input("Yes price (cents)", min_value=1, max_value=99,
-                                       step=1, key="yes_price_val")
-
-    if st.button("Analyze Contract", type="primary", use_container_width=True):
-        from stock_agent.prediction_market import evaluate_contract, evaluate_range_contract
-        from stock_agent.trading import TradeParams, Signal
-
-        tp = TradeParams(
-            bankroll=bankroll,
-            kelly_fraction=0.25,
-            max_position_pct=0.10,
-            min_edge_pct=0.03,
-            transaction_cost_pct=0.02,
-        )
-        d = evaluate_contract(symbol, strike_input, yes_price_input,
-                              current_price, annual_vol, horizon, tp, annual_drift,
-                              tail_dof, calibration)
-
-        # Result card
-        if d.signal == Signal.BUY:
-            color = "normal"
-            action = f"BUY YES at {yes_price_input}c"
-        elif d.signal == Signal.SELL:
-            color = "inverse"
-            action = f"BUY NO at {100 - yes_price_input}c"
-        else:
-            color = "off"
-            action = "HOLD — edge too thin"
-
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Raw P(Yes)", f"{(d.raw_fair_prob or d.fair_prob):.1%}")
-        r2.metric("Cal P(Yes)", f"{d.fair_prob:.1%}")
-        r3.metric("Net Edge",   f"{d.net_edge:+.1%}")
-        r4.metric("Size",       f"${d.sized_dollars:,.0f}")
-
-        if d.signal != Signal.HOLD:
-            st.success(f"**{action}** — edge {d.net_edge:+.1%} vs market")
-        else:
-            st.warning(f"**HOLD** — edge {d.raw_edge:+.1%} is too thin after spread")
 
     st.divider()
     st.subheader("Evaluate Kalshi")
@@ -690,7 +574,10 @@ with right:
                                                 float(k_price), current_price, annual_vol,
                                                 horizon, tp, annual_drift, tail_dof)
                 else:
-                    k_strike = q["strike"] or strike_input
+                    k_strike = q["strike"]
+                    if k_strike is None:
+                        st.error("Cannot determine strike for this market. Use a KXBTCD range contract instead.")
+                        st.stop()
                     d = evaluate_contract(symbol, float(k_strike), float(k_price),
                                           current_price, annual_vol, horizon, tp,
                                           annual_drift, tail_dof, calibration)
@@ -706,152 +593,6 @@ with right:
                     st.warning(f"**HOLD** - edge {d.raw_edge:+.1%} is too thin after spread")
         except Exception as e:
             st.error(f"Could not fetch Kalshi market: {e}")
-
-    # ---- Quick Scan (mirrors Robinhood hourly contract grid) ---------------
-    st.divider()
-    st.subheader("Quick Scan")
-    st.caption("Strikes auto-set at $100 increments. Fill in Yes prices from Robinhood, then Scan.")
-
-    # Generate 7 strikes at $100 increments centred on spot
-    base = round(current_price / 100) * 100
-    qs_strikes = [base + (i - 3) * 100 for i in range(7)]   # base-300 … base+300
-
-    # Editable grid: user fills Yes price (default 50) for each strike
-    qs_df = pd.DataFrame({
-        "Strike ($)": [f"{int(s):,}" for s in qs_strikes],
-        "Yes price (¢)": [50] * 7,
-    })
-    edited = st.data_editor(
-        qs_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Strike ($)":      st.column_config.TextColumn(disabled=True),
-            "Yes price (¢)":   st.column_config.NumberColumn(min_value=1, max_value=99, step=1),
-        },
-        key="quick_scan_grid",
-    )
-
-    if st.button("Scan All", use_container_width=True, type="primary"):
-        from stock_agent.prediction_market import scan_contracts
-        from stock_agent.trading import TradeParams, Signal
-
-        tp = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
-                         max_position_pct=0.10, min_edge_pct=0.03,
-                         transaction_cost_pct=0.02)
-
-        contracts = {
-            qs_strikes[i]: float(edited.iloc[i]["Yes price (¢)"])
-            for i in range(len(qs_strikes))
-        }
-        decisions = scan_contracts(symbol, current_price, annual_vol,
-                                   contracts, horizon, tp, annual_drift, tail_dof,
-                                   calibration)
-
-        result_rows = []
-        for d in decisions:
-            if d.signal == Signal.BUY:
-                action = f"BUY YES  ${d.sized_dollars:,.0f}"
-                bg = "#1a6644"
-            elif d.signal == Signal.SELL:
-                action = f"BUY NO   ${d.sized_dollars:,.0f}"
-                bg = "#7a1a2e"
-            else:
-                action = "HOLD"
-                bg = ""
-            result_rows.append({
-                "Strike":   f"${d.strike:,.0f}",
-                "Raw":      f"{(d.raw_fair_prob or d.fair_prob):.0%}",
-                "Cal":      f"{d.fair_prob:.0%}",
-                "Mkt":      f"{d.contract_price_pct:.0%}",
-                "Edge":     f"{d.net_edge:+.0%}",
-                "Action":   action,
-                "_bg":      bg,
-            })
-
-        df_result = pd.DataFrame(result_rows)
-        bg_colors = df_result["_bg"].tolist()
-        df_display = df_result.drop(columns=["_bg"])
-
-        def _hl(row):
-            bg = bg_colors[row.name]
-            return [f"background-color: {bg}; color: white" if bg else ""] * len(row)
-
-        st.dataframe(
-            df_display.style.apply(_hl, axis=1),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-# ---------------------------------------------------------------------------
-# Contract Watchlist (full-width, auto-scanned every refresh)
-# ---------------------------------------------------------------------------
-
-st.divider()
-st.subheader("Contract Watchlist")
-st.caption(f"Re-evaluated every 30s. Alert fires when edge >= {alert_threshold}%.")
-
-wa, wb, wc = st.columns([3, 1, 1])
-wl_input = wa.text_input("Add contract (strike:yes_price)",
-                          placeholder="76385:61",
-                          label_visibility="collapsed",
-                          key="wl_text")
-if wb.button("Add", use_container_width=True) and wl_input:
-    try:
-        k, v = wl_input.strip().split(":")
-        st.session_state["watchlist"][float(k.strip())] = float(v.strip())
-        st.rerun()
-    except Exception:
-        st.error("Format: strike:yes_price  e.g. 76385:61")
-if wc.button("Clear All", use_container_width=True) and st.session_state["watchlist"]:
-    st.session_state["watchlist"] = {}
-    st.session_state["alerted"]   = set()
-    st.rerun()
-
-if watch_decisions:
-    wl_rows = []
-    for d in watch_decisions:
-        orig_price = st.session_state["watchlist"].get(d.strike, 0)
-        wl_rows.append({
-            "Strike":   f"${d.strike:,.2f}",
-            "Yes (c)":  int(orig_price),
-            "Raw":      f"{(d.raw_fair_prob or d.fair_prob):.1%}",
-            "Cal":      f"{d.fair_prob:.1%}",
-            "Market":   f"{d.contract_price_pct:.1%}",
-            "Edge":     f"{d.net_edge:+.1%}",
-            "Signal":   d.signal.value,
-            "Action":   (f"BUY {'YES' if d.signal == Signal.BUY else 'NO'}  "
-                         f"${d.sized_dollars:,.0f}") if d.signal != Signal.HOLD else "HOLD",
-        })
-
-    df_watch = pd.DataFrame(wl_rows)
-
-    def _highlight_watch(row):
-        try:
-            edge_val = float(row["Edge"].replace("%", "").replace("+", "")) / 100
-        except ValueError:
-            edge_val = 0.0
-        sig = row["Signal"]
-        is_hot = abs(edge_val) >= alert_threshold / 100
-        if "BUY" in sig and is_hot:
-            return ["background-color: #0a3d20"] * len(row)
-        if "SELL" in sig and is_hot:
-            return ["background-color: #3d0a0a"] * len(row)
-        if "BUY" in sig:
-            return ["background-color: #0d3d2e"] * len(row)
-        if "SELL" in sig:
-            return ["background-color: #3d0d0d"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(
-        df_watch.style.apply(_highlight_watch, axis=1),
-        use_container_width=True,
-        hide_index=True,
-    )
-elif st.session_state["watchlist"]:
-    st.info("Watchlist loaded — will be evaluated on next refresh.")
-else:
-    st.caption("Add contracts above. They will be auto-scanned every 30 seconds.")
 
 # ---------------------------------------------------------------------------
 # Auto-refresh
