@@ -512,33 +512,40 @@ with left:
             else:
                 st.info(f"**AI: {report.contract_action}**")
 
-        # Log button — only shown when there's an active contract recommendation
+        # Log button — pick the contract with highest absolute edge that has a BUY signal
         _best_contract = next(
-            (r for r in _kx_evaluated
-             if r["action"] in ("BUY YES", "BUY NO") and abs(r["edge_pct"]) >= 0.03),
-            _kx_evaluated[0] if _kx_evaluated else None,
+            (r for r in sorted(_kx_evaluated, key=lambda r: abs(r["edge_pct"]), reverse=True)
+             if r["action"] in ("BUY YES", "BUY NO")),
+            None,
         )
         if _best_contract and report.contract_action and not report.contract_action.upper().startswith("SKIP"):
             if st.button("Log AI Recommendation", type="primary", use_container_width=True):
                 try:
                     from stock_agent.trade_log import log_recommendation
+                    # minutes_left may be stored as "?" string — coerce to float or None
+                    _ml_raw = _best_contract.get("minutes_left")
+                    try:
+                        _ml = float(_ml_raw) if _ml_raw not in (None, "?", "") else None
+                    except (TypeError, ValueError):
+                        _ml = None
+                    _close_time = next(
+                        (m.get("close_time", "") for m in st.session_state.get("kxbtcd_markets", [])
+                         if m.get("ticker") == _best_contract["ticker"]), ""
+                    )
                     _row_id = log_recommendation(
                         ticker=_best_contract["ticker"],
                         floor_strike=_best_contract.get("floor"),
-                        close_time=next(
-                            (m.get("close_time", "") for m in st.session_state.get("kxbtcd_markets", [])
-                             if m.get("ticker") == _best_contract["ticker"]), ""
-                        ),
+                        close_time=_close_time,
                         kalshi_price_c=_best_contract["kalshi_c"],
                         fair_prob=_best_contract["fair_pct"],
                         edge=_best_contract["edge_pct"],
                         ai_action=report.contract_action[:50],
                         ai_confidence=report.confidence,
                         ai_bias=report.drift_bias,
-                        minutes_left=_best_contract.get("minutes_left"),
+                        minutes_left=_ml,
                         btc_price=current_price,
                     )
-                    st.success(f"Logged: {_row_id}")
+                    st.success(f"Logged {_best_contract['ticker']} — id: {_row_id}")
                 except Exception as _log_err:
                     st.error(f"Log failed: {_log_err}")
 
