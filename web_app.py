@@ -163,7 +163,7 @@ with st.sidebar:
     horizon      = st.slider("Contract horizon (min)", 15, 240, 60)
     bankroll     = st.number_input("Bankroll ($)", min_value=100, value=1000, step=100)
     vol_window   = st.slider("Vol estimation window (hourly candles)", 24, 120, 60)
-    auto_refresh = st.checkbox("Auto-refresh every 30s", value=True)
+    auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
 
     st.divider()
     st.caption("Data: Robinhood (live price) + yfinance (1-hour candles)")
@@ -684,5 +684,5 @@ except Exception as _tl_err:
 # ---------------------------------------------------------------------------
 
 if auto_refresh:
-    time.sleep(30)
+    time.sleep(60)
     st.rerun()
