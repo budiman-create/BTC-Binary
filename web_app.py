@@ -125,6 +125,7 @@ def get_ai_analysis(
     price_1h_ago: float | None,
     price_2h_ago: float | None,
     contracts_context: str = "",
+    history_context: str = "",
 ):
     from stock_agent.ai_analyst import analyse_btc
     try:
@@ -143,6 +144,7 @@ def get_ai_analysis(
             price_1h_ago=price_1h_ago,
             price_2h_ago=price_2h_ago,
             contracts_context=contracts_context,
+            history_context=history_context,
         )
         return report, raw_news, None
     except Exception as e:
@@ -256,6 +258,17 @@ st.caption(
     f"EMA9: ${signal_details['ema9']:,.0f}  EMA21: ${signal_details['ema21']:,.0f}  |  "
     f"Funding drift: {funding_drift:+.1f}  |  Blended drift: {annual_drift:+.1f}"
 )
+
+# ---------------------------------------------------------------------------
+# Trade log — resolve outcomes + build history for AI
+# ---------------------------------------------------------------------------
+
+try:
+    from stock_agent.trade_log import check_and_mark_outcomes, build_history_context
+    check_and_mark_outcomes()
+    _history_context = build_history_context(n=10)
+except Exception:
+    _history_context = ""
 
 if "kxbtcd_markets" not in st.session_state:
     st.session_state["kxbtcd_markets"] = []
@@ -458,7 +471,7 @@ with left:
         signal_details["ema_cross"], signal_details["price_pos"],
         signal_details["vol_factor"], funding_rate, tail_dof, horizon,
         _minutes_left, _price_1h_ago, _price_2h_ago,
-        _contracts_context,
+        _contracts_context, _history_context,
     )
 
     if ai_error:
@@ -498,6 +511,36 @@ with left:
                 st.error(f"**AI: {report.contract_action}**")
             else:
                 st.info(f"**AI: {report.contract_action}**")
+
+        # Log button — only shown when there's an active contract recommendation
+        _best_contract = next(
+            (r for r in _kx_evaluated
+             if r["action"] in ("BUY YES", "BUY NO") and abs(r["edge_pct"]) >= 0.03),
+            _kx_evaluated[0] if _kx_evaluated else None,
+        )
+        if _best_contract and report.contract_action and not report.contract_action.upper().startswith("SKIP"):
+            if st.button("Log AI Recommendation", type="primary", use_container_width=True):
+                try:
+                    from stock_agent.trade_log import log_recommendation
+                    _row_id = log_recommendation(
+                        ticker=_best_contract["ticker"],
+                        floor_strike=_best_contract.get("floor"),
+                        close_time=next(
+                            (m.get("close_time", "") for m in st.session_state.get("kxbtcd_markets", [])
+                             if m.get("ticker") == _best_contract["ticker"]), ""
+                        ),
+                        kalshi_price_c=_best_contract["kalshi_c"],
+                        fair_prob=_best_contract["fair_pct"],
+                        edge=_best_contract["edge_pct"],
+                        ai_action=report.contract_action[:50],
+                        ai_confidence=report.confidence,
+                        ai_bias=report.drift_bias,
+                        minutes_left=_best_contract.get("minutes_left"),
+                        btc_price=current_price,
+                    )
+                    st.success(f"Logged: {_row_id}")
+                except Exception as _log_err:
+                    st.error(f"Log failed: {_log_err}")
 
         with st.expander("Analyst report", expanded=False):
             st.write(f"**Trend:** {report.fundamental_summary}")
@@ -573,6 +616,61 @@ with right:
     elif st.session_state.get("kxbtcd_markets"):
         st.info("KXBTCD markets loaded but no orderbook prices available yet.")
 
+
+# ---------------------------------------------------------------------------
+# Trade log history
+# ---------------------------------------------------------------------------
+
+st.divider()
+st.subheader("Trade Log & AI Track Record")
+
+try:
+    from stock_agent.trade_log import get_recent_history, accuracy_stats
+
+    stats = accuracy_stats()
+    if stats["total"] > 0:
+        stat_c1, stat_c2, stat_c3, stat_c4 = st.columns(4)
+        stat_c1.metric("Resolved Trades", stats["total"])
+        stat_c2.metric("Correct", stats["correct"])
+        win_pct = f"{stats['win_rate']:.0%}" if stats["win_rate"] is not None else "N/A"
+        stat_c3.metric("Win Rate", win_pct)
+        avg_edge_c = (
+            f"{stats['avg_edge_correct']:+.1%}" if stats["avg_edge_correct"] is not None else "N/A"
+        )
+        stat_c4.metric("Avg Edge (correct trades)", avg_edge_c)
+
+    history_rows = get_recent_history(n=20)
+    if history_rows:
+        def _fmt_bool(val: str) -> str:
+            if val in ("True", "true", "1"):
+                return "YES"
+            if val in ("False", "false", "0"):
+                return "NO"
+            return "—"
+
+        log_df = pd.DataFrame([
+            {
+                "Time (UTC)":  r.get("logged_at", "")[:16].replace("T", " "),
+                "Ticker":      r.get("ticker", ""),
+                "Floor":       f"${float(r['floor_strike']):,.0f}" if r.get("floor_strike") else "—",
+                "Kalshi":      f"{float(r['kalshi_price_c']):.1f}c" if r.get("kalshi_price_c") else "—",
+                "Fair":        f"{float(r['fair_prob']):.1%}" if r.get("fair_prob") else "—",
+                "Edge":        f"{float(r['edge']):+.1%}" if r.get("edge") else "—",
+                "AI Action":   r.get("ai_action", "")[:20],
+                "Conf":        r.get("ai_confidence", ""),
+                "Min Left":    r.get("minutes_left", "—"),
+                "BTC $":       f"${float(r['btc_price']):,.0f}" if r.get("btc_price") else "—",
+                "Resolved":    _fmt_bool(r.get("resolved", "")),
+                "Result":      _fmt_bool(r.get("resolved_yes", "")),
+                "Correct":     _fmt_bool(r.get("ai_correct", "")),
+            }
+            for r in history_rows
+        ])
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No trades logged yet. Click 'Log AI Recommendation' after loading KXBTCD contracts.")
+except Exception as _tl_err:
+    st.warning(f"Trade log unavailable: {_tl_err}")
 
 # ---------------------------------------------------------------------------
 # Auto-refresh

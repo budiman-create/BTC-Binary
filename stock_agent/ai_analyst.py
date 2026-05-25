@@ -186,6 +186,7 @@ def _build_btc_prompt(
     price_2h_ago: float | None,
     extra_context: str = "",
     contracts_context: str = "",
+    history_context: str = "",
 ) -> str:
     import math
 
@@ -224,6 +225,7 @@ def _build_btc_prompt(
         pa_lines.append(f"  2h ago    : ${price_2h_ago:,.2f}  (prev hour {chg_prev:+.3%} -> momentum {accel_str})")
     price_action_block = "\n".join(pa_lines)
 
+    history_block = f"\n{history_context}\n" if history_context else ""
     contract_block = ""
     action_field = ""
     if contracts_context:
@@ -248,7 +250,7 @@ Funding rate   : {funding_rate*100:.4f}%  ->  {funding_bias}
 Tail dof       : {tail_dof:.1f}  ({'fat tails' if tail_dof < 15 else 'near-normal'})
 {time_block}{price_action_block}
 
-{extra_context}{contract_block}
+{history_block}{extra_context}{contract_block}
 Return your answer in EXACTLY this format (no extra text before or after):
 
 FUNDAMENTAL: <2-3 sentences focused on current price action and momentum within the 1h window>
@@ -275,6 +277,7 @@ def analyse_btc(
     price_1h_ago: float | None = None,
     price_2h_ago: float | None = None,
     contracts_context: str = "",
+    history_context: str = "",
     groq_api_key: str | None = None,
     news_api_key: str | None = None,
     model: str = "llama-3.3-70b-versatile",
@@ -282,9 +285,10 @@ def analyse_btc(
     """
     Analyse a BTC prediction market contract using live quant signals + news context.
 
-    minutes_left  : actual minutes to contract expiry (overrides horizon_minutes for urgency)
-    price_1h_ago  : BTC close price 1 hour ago (from intraday candles)
-    price_2h_ago  : BTC close price 2 hours ago
+    minutes_left    : actual minutes to contract expiry (overrides horizon_minutes for urgency)
+    price_1h_ago    : BTC close price 1 hour ago (from intraday candles)
+    price_2h_ago    : BTC close price 2 hours ago
+    history_context : formatted track-record string from trade_log.build_history_context()
     """
     from .news_context import build_extra_context
 
@@ -302,7 +306,7 @@ def analyse_btc(
         ema_cross, price_pos, vol_factor, funding_rate,
         tail_dof, horizon_minutes, minutes_left,
         price_1h_ago, price_2h_ago,
-        extra_context, contracts_context,
+        extra_context, contracts_context, history_context,
     )
 
     client = Groq(api_key=key)
