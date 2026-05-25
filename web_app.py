@@ -134,6 +134,38 @@ def get_kalshi_btc_markets(max_expiry_hours: float | None = None):
     return find_btc_markets(max_expiry_hours=max_expiry_hours)
 
 
+@st.cache_data(ttl=180)   # refresh every 3 min — news doesn't change every second
+def get_ai_analysis(
+    symbol: str,
+    current_price: float,
+    annual_vol: float,
+    annual_drift: float,
+    ema_cross: str,
+    price_pos: str,
+    vol_factor: float,
+    funding_rate: float,
+    tail_dof: float,
+    horizon: int,
+):
+    from stock_agent.ai_analyst import analyse_btc
+    try:
+        report, raw_news = analyse_btc(
+            symbol=symbol,
+            current_price=current_price,
+            annual_vol=annual_vol,
+            annual_drift=annual_drift,
+            ema_cross=ema_cross,
+            price_pos=price_pos,
+            vol_factor=vol_factor,
+            funding_rate=funding_rate,
+            tail_dof=tail_dof,
+            horizon_minutes=horizon,
+        )
+        return report, raw_news, None
+    except Exception as e:
+        return None, {}, str(e)
+
+
 
 # ---------------------------------------------------------------------------
 # Sidebar — settings
@@ -366,6 +398,58 @@ with left:
         showlegend=False,
     )
     st.plotly_chart(fig2, use_container_width=True)
+
+    # -- AI Analysis ----------------------------------------------------------
+    st.subheader("AI Analysis (Groq + Live News)")
+    st.caption("Llama-3.3-70b reads Fear & Greed + CryptoPanic headlines — refreshes every 3 min")
+
+    report, raw_news, ai_error = get_ai_analysis(
+        symbol, current_price, annual_vol, annual_drift,
+        signal_details["ema_cross"], signal_details["price_pos"],
+        signal_details["vol_factor"], funding_rate, tail_dof, horizon,
+    )
+
+    if ai_error:
+        st.error(f"AI analyst unavailable: {ai_error}")
+    elif report:
+        fg = raw_news.get("fear_greed", {})
+        news_items = raw_news.get("news", [])
+
+        # Bias badge
+        bias_colors = {
+            "strongly_bullish": "#00d4aa",
+            "bullish":          "#4ade80",
+            "neutral":          "#94a3b8",
+            "bearish":          "#f87171",
+            "strongly_bearish": "#ef4444",
+        }
+        bias_col, conf_col, fg_col = st.columns(3)
+        bias_col.metric(
+            "AI Bias",
+            report.drift_bias.replace("_", " ").title(),
+            delta=f"drift {report.drift_nudge:+.0%} p.a.",
+            delta_color="normal" if report.drift_nudge >= 0 else "inverse",
+        )
+        conf_col.metric("Confidence", report.confidence.title())
+        if fg:
+            fg_delta = "Greed" if fg["value"] > 60 else ("Fear" if fg["value"] < 40 else "Neutral")
+            fg_col.metric("Fear & Greed", f"{fg['value']} — {fg['classification']}", delta=fg_delta,
+                          delta_color="inverse" if fg["value"] > 60 else "normal")
+
+        with st.expander("Analyst report", expanded=True):
+            st.write(f"**Trend:** {report.fundamental_summary}")
+            st.write(f"**Macro:** {report.macro_summary}")
+            if report.key_catalysts:
+                st.write("**Catalysts:** " + "  •  ".join(report.key_catalysts))
+            if report.key_risks:
+                st.write("**Risks:** " + "  •  ".join(report.key_risks))
+
+        if news_items:
+            with st.expander(f"Live headlines ({len(news_items)})", expanded=False):
+                for item in news_items:
+                    votes = item["votes_positive"] - item["votes_negative"]
+                    sentiment_icon = "🟢" if votes > 2 else ("🔴" if votes < -2 else "⚪")
+                    st.write(f"{sentiment_icon} {item['title']}")
 
 
 # ---- Probability ladder + contract evaluator -------------------------------
