@@ -99,26 +99,78 @@ def funding_rate_to_drift(funding_rate: float) -> float:
 
 def fetch_intraday(symbol: str, lookback_hours: int = 720) -> pd.DataFrame:
     """
-    Download 1-hour OHLCV candles for the last N hours from yfinance.
+    Download 1-hour OHLCV candles from Binance (no API key needed).
+    Falls back to yfinance if Binance is unavailable.
     Default 720h = 30 days, giving ~720 candles for robust GARCH/vol estimation.
     """
+    binance_sym = _BINANCE_SYMBOLS.get(symbol.upper(), f"{symbol.upper()}USDT")
+    try:
+        df = _fetch_binance_klines(binance_sym, interval="1h", lookback_hours=lookback_hours)
+        if not df.empty:
+            return df
+        raise ValueError("Binance returned empty data")
+    except Exception as binance_err:
+        # Fallback to yfinance
+        import datetime as dt
+        yf_sym = f"{symbol.upper()}-USD" if "-" not in symbol else symbol.upper()
+        end   = dt.datetime.utcnow()
+        start = end - dt.timedelta(hours=lookback_hours)
+        df = yf.download(yf_sym, start=start, end=end, interval="1h",
+                         auto_adjust=True, progress=False)
+        if df.empty:
+            raise ValueError(
+                f"No candle data for {symbol}. "
+                f"Binance error: {binance_err}"
+            )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+
+def _fetch_binance_klines(symbol: str, interval: str = "1h", lookback_hours: int = 720) -> pd.DataFrame:
+    """
+    Fetch OHLCV candles from Binance REST API. No key required.
+    Paginates automatically when lookback_hours > 1000.
+    """
     import datetime as dt
-    yf_sym = f"{symbol.upper()}-USD" if "-" not in symbol else symbol.upper()
-    end   = dt.datetime.utcnow()
-    start = end - dt.timedelta(hours=lookback_hours)
-    df = yf.download(
-        yf_sym,
-        start=start,
-        end=end,
-        interval="1h",
-        auto_adjust=True,
-        progress=False,
-    )
-    if df.empty:
-        raise ValueError(f"No intraday data for {yf_sym}. Check symbol.")
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+    url     = "https://api.binance.com/api/v3/klines"
+    limit   = 1000   # Binance max per request
+    all_rows: list[list] = []
+
+    # Work backwards in 1000-candle chunks
+    end_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+    remaining = lookback_hours
+
+    while remaining > 0:
+        chunk = min(remaining, limit)
+        params = {
+            "symbol":   symbol,
+            "interval": interval,
+            "limit":    chunk,
+            "endTime":  end_ms,
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            break
+        all_rows = rows + all_rows
+        end_ms    = int(rows[0][0]) - 1   # go back before the oldest candle
+        remaining -= chunk
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "Open", "High", "Low", "Close", "Volume",
+        "close_time", "quote_vol", "trades",
+        "taker_base", "taker_quote", "ignore",
+    ])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.set_index("open_time")
+    df.index.name = "Datetime"
+    return df[["Open", "High", "Low", "Close", "Volume"]].astype(float).dropna()
 
 
 def realised_vol_annual(df: pd.DataFrame, window: int = VOL_WINDOW) -> float:

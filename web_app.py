@@ -15,6 +15,7 @@ Features:
 
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -166,7 +167,7 @@ with st.sidebar:
     auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
 
     st.divider()
-    st.caption("Data: Robinhood (live price) + yfinance (1-hour candles)")
+    st.caption("Data: Robinhood (live price) + Binance (1-hour candles, fallback: yfinance)")
     st.caption("Model: blended vol + calibration + momentum + Student-t tails")
 
 # ---------------------------------------------------------------------------
@@ -278,9 +279,36 @@ except Exception:
 # ---------------------------------------------------------------------------
 import datetime as _dt
 
-_now_et   = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=4)
+_now_utc = _dt.datetime.now(_dt.timezone.utc)
+_now_et = _now_utc.astimezone(ZoneInfo("America/New_York"))
 # Next full hour: if it's 15:10 → 16, if it's 16:00 exactly → 17 (that contract just expired)
 _next_hour_et = (_now_et.hour + 1) % 24
+
+
+def _parse_market_close_time(value: str | None):
+    if not value:
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt.astimezone(_dt.timezone.utc)
+
+
+def _market_is_live(market: dict, min_minutes_left: float = 1.0) -> bool:
+    close_dt = _parse_market_close_time(market.get("close_time"))
+    if close_dt is not None and close_dt <= _now_utc:
+        return False
+    minutes_left = market.get("minutes_left")
+    try:
+        if minutes_left is not None and float(minutes_left) < min_minutes_left:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
 
 if "kxbtcd_markets" not in st.session_state:
     st.session_state["kxbtcd_markets"] = []
@@ -296,6 +324,11 @@ if st.session_state.get("kxbtcd_auto_hour") != _next_hour_et:
     except Exception:
         pass
 
+if st.session_state.get("kxbtcd_markets"):
+    st.session_state["kxbtcd_markets"] = [
+        m for m in st.session_state["kxbtcd_markets"] if _market_is_live(m)
+    ]
+
 # ---------------------------------------------------------------------------
 # Pre-compute KXBTCD contract evaluations (used by both right column + AI)
 # ---------------------------------------------------------------------------
@@ -310,10 +343,14 @@ _price_2h_ago = float(_close.iloc[-3]) if len(_close) >= 3 else None
 # Minutes left on the nearest-expiry contract (most urgent clock)
 _minutes_left: float | None = None
 if st.session_state.get("kxbtcd_markets"):
-    _ml_vals = [
-        m["minutes_left"] for m in st.session_state["kxbtcd_markets"]
-        if m.get("minutes_left") is not None
-    ]
+    _ml_vals = []
+    for m in st.session_state["kxbtcd_markets"]:
+        try:
+            minutes = float(m.get("minutes_left"))
+        except (TypeError, ValueError):
+            continue
+        if minutes > 0:
+            _ml_vals.append(minutes)
     if _ml_vals:
         _minutes_left = min(_ml_vals)
 
@@ -325,6 +362,8 @@ if st.session_state.get("kxbtcd_markets"):
                          max_position_pct=0.10, min_edge_pct=0.03,
                          transaction_cost_pct=0.02)
     for _m in st.session_state["kxbtcd_markets"]:
+        if not _market_is_live(_m):
+            continue
         _price = _m.get("display_price_cents")
         if _price is None:
             continue
@@ -340,6 +379,7 @@ if st.session_state.get("kxbtcd_markets"):
             _kx_evaluated.append({
                 "ticker":      _m["ticker"],
                 "floor":       _m.get("floor_strike"),
+                "close_time":  _m.get("close_time", ""),
                 "minutes_left": _m.get("minutes_left", "?"),
                 "kalshi_c":    float(_price),
                 "fair_pct":    _d.fair_prob,
@@ -535,27 +575,32 @@ with left:
             else:
                 st.info(f"**AI: {report.contract_action}**")
 
-        # Auto-log the AI recommendation once per unique (ticker + action) combination.
-        # Session state fingerprint prevents duplicate rows on every 60s refresh.
-        _best_contract = next(
-            (r for r in sorted(_kx_evaluated, key=lambda r: abs(r["edge_pct"]), reverse=True)
-             if r["action"] in ("BUY YES", "BUY NO")),
-            None,
-        )
-        if _best_contract and report.contract_action and not report.contract_action.upper().startswith("SKIP"):
-            _log_fingerprint = f"{_best_contract['ticker']}|{report.contract_action[:50]}"
+        # Auto-log one live directional recommendation per contract side.
+        _action_upper = (report.contract_action or "").upper()
+        _ai_side = "YES" if "BUY YES" in _action_upper else ("NO" if "BUY NO" in _action_upper else None)
+        _best_contract = None
+        if _ai_side:
+            _best_contract = next(
+                (r for r in sorted(_kx_evaluated, key=lambda r: abs(r["edge_pct"]), reverse=True)
+                 if r["action"] == f"BUY {_ai_side}" and _market_is_live(r)),
+                None,
+            )
+        if _best_contract and _ai_side:
+            _log_fingerprint = f"{_best_contract['ticker']}|{_ai_side}"
             if st.session_state.get("last_log_fingerprint") != _log_fingerprint:
                 try:
-                    from stock_agent.trade_log import log_recommendation
+                    from stock_agent.trade_log import is_contract_loggable, log_recommendation
                     _ml_raw = _best_contract.get("minutes_left")
                     try:
                         _ml = float(_ml_raw) if _ml_raw not in (None, "?", "") else None
                     except (TypeError, ValueError):
                         _ml = None
-                    _close_time = next(
-                        (m.get("close_time", "") for m in st.session_state.get("kxbtcd_markets", [])
-                         if m.get("ticker") == _best_contract["ticker"]), ""
-                    )
+                    _close_time = _best_contract.get("close_time", "")
+                    _ok_to_log, _skip_reason = is_contract_loggable(_close_time, _ml)
+                    if not _ok_to_log:
+                        st.caption(f"Not logged: {_skip_reason}")
+                        st.session_state["last_log_fingerprint"] = _log_fingerprint
+                        raise ValueError(_skip_reason)
                     _row_id = log_recommendation(
                         ticker=_best_contract["ticker"],
                         floor_strike=_best_contract.get("floor"),
@@ -563,14 +608,17 @@ with left:
                         kalshi_price_c=_best_contract["kalshi_c"],
                         fair_prob=_best_contract["fair_pct"],
                         edge=_best_contract["edge_pct"],
-                        ai_action=report.contract_action[:50],
+                        ai_action=report.contract_action,
                         ai_confidence=report.confidence,
                         ai_bias=report.drift_bias,
                         minutes_left=_ml,
                         btc_price=current_price,
+                        side=_ai_side,
                     )
                     st.session_state["last_log_fingerprint"] = _log_fingerprint
                     st.info(f"Auto-logged: {_best_contract['ticker']} — {report.contract_action[:40]}")
+                except ValueError:
+                    pass
                 except Exception as _log_err:
                     st.warning(f"Auto-log failed: {_log_err}")
             else:
@@ -631,9 +679,12 @@ with right:
     if kx_col2.button("Reload", use_container_width=True):
         try:
             from stock_agent.kalshi_market import find_kxbtcd_atm_markets
-            st.session_state["kxbtcd_markets"]  = find_kxbtcd_atm_markets(
+            _loaded_markets = find_kxbtcd_atm_markets(
                 current_price, hour_et=kxbtcd_hour
             )
+            st.session_state["kxbtcd_markets"] = [
+                m for m in _loaded_markets if _market_is_live(m)
+            ]
             st.session_state["kxbtcd_auto_hour"] = kxbtcd_hour
             if not st.session_state["kxbtcd_markets"]:
                 st.warning(f"No open KXBTCD markets found for {kxbtcd_hour:02d}:00 ET today.")
@@ -680,7 +731,7 @@ try:
         )
         stat_c4.metric("Avg Edge (correct trades)", avg_edge_c)
 
-    history_rows = get_recent_history(n=30)
+    history_rows = get_recent_history(n=30, valid_only=True)
     if history_rows:
         def _fmt_bool(val: str) -> str:
             if val in ("True", "true", "1"):
