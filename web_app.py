@@ -6,10 +6,10 @@ Run:
 
 Features:
   - Live BTC price + bid/ask from Robinhood
-  - Real-time intraday volatility from 1-min data
+  - Real-time intraday volatility from 1-hour candle data (30 days)
   - Probability ladder: fair Yes/No odds at strikes around spot
   - Contract evaluator: paste strike + Yes price → instant BUY/SELL/HOLD signal
-  - 1-min price chart (last 2 hours)
+  - 1-hour price chart (last 30 days)
   - Auto-refresh every 30 seconds
 """
 
@@ -53,36 +53,92 @@ def get_live_price(symbol: str):
             "spread": data.spread_pct,
         }
     except Exception as e:
-        return {"error": str(e)}
+        try:
+            import yfinance as yf
+
+            yf_symbol = f"{symbol.upper()}-USD"
+            df = yf.download(yf_symbol, period="1d", interval="1m",
+                             auto_adjust=True, progress=False)
+            if df.empty:
+                raise ValueError("yfinance returned no fallback price data")
+            return {
+                "price": float(df["Close"].dropna().iloc[-1]),
+                "bid": None,
+                "ask": None,
+                "spread": None,
+                "source": "yfinance fallback",
+                "warning": str(e),
+            }
+        except Exception:
+            return {"error": str(e)}
 
 
 @st.cache_data(ttl=8)
-def get_intraday(symbol: str, hours: int = 3):
+def get_intraday(symbol: str, hours: int = 720, vol_window: int = 60, horizon: int = 60):
     from stock_agent.prediction_market import (
-        fetch_intraday, realised_vol_annual, garch_vol_annual,
-        estimate_chart_signal, estimate_tail_dof,
+        build_probability_calibration, blended_vol_annual, estimate_chart_signal,
+        estimate_tail_dof, fetch_intraday,
     )
     df = fetch_intraday(symbol, lookback_hours=hours)
     drift, signal_details = estimate_chart_signal(df)
     tail_dof = estimate_tail_dof(df)
-    try:
-        vol = garch_vol_annual(df, window=60)
-        vol_source = "GARCH"
-    except Exception:
-        vol = realised_vol_annual(df, window=60)
-        vol_source = "Realised"
-    return df, vol, drift, vol_source, tail_dof, signal_details
+    vol_est = blended_vol_annual(df, window=vol_window)
+    calibration = build_probability_calibration(df, horizon_minutes=horizon, vol_window=vol_window)
+    return df, vol_est.annual_vol, drift, vol_est.source, tail_dof, signal_details, calibration, vol_est
+
+
+@st.cache_data(ttl=300)   # funding changes every 8h — no need to refresh often
+def get_funding(symbol: str):
+    from stock_agent.prediction_market import fetch_funding_rate, funding_rate_to_drift
+    rate, status = fetch_funding_rate(symbol)
+    drift = funding_rate_to_drift(rate)
+    return rate, drift, status
 
 
 @st.cache_data(ttl=8)
 def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: int,
-               annual_drift: float = 0.0, tail_dof: float = 30.0):
+               annual_drift: float = 0.0, tail_dof: float = 30.0,
+               calibration=None):
     from stock_agent.prediction_market import probability_ladder, sigma_over_horizon
     rows = probability_ladder(current_price, annual_vol, horizon,
                               num_strikes=14, pct_range=0.025,
-                              annual_drift=annual_drift, tail_dof=tail_dof)
+                              annual_drift=annual_drift, tail_dof=tail_dof,
+                              calibration=calibration)
     sig_T = sigma_over_horizon(annual_vol, horizon)
     return rows, sig_T
+
+
+@st.cache_data(ttl=8)
+def get_kalshi_quote(ticker: str):
+    from stock_agent.kalshi_market import get_quote
+
+    q = get_quote(ticker)
+    return {
+        "ticker": q.ticker,
+        "title": q.title,
+        "strike": q.strike,
+        "floor_strike": q.floor_strike,
+        "cap_strike": q.cap_strike,
+        "strike_type": q.strike_type,
+        "yes_bid_cents": q.yes_bid_cents,
+        "yes_ask_cents": q.yes_ask_cents,
+        "yes_mid_cents": q.yes_mid_cents,
+        "display_price_cents": q.display_price_cents,
+    }
+
+
+@st.cache_data(ttl=60)
+def get_kalshi_btc_markets(max_expiry_hours: float | None = None):
+    from stock_agent.kalshi_market import find_btc_markets
+
+    return find_btc_markets(max_expiry_hours=max_expiry_hours)
+
+
+@st.cache_data(ttl=8)
+def get_kalshi_btc_quotes(markets: list[dict]):
+    from stock_agent.kalshi_market import attach_orderbook_quotes
+
+    return attach_orderbook_quotes(markets)
 
 
 # ---------------------------------------------------------------------------
@@ -91,16 +147,17 @@ def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: in
 
 with st.sidebar:
     st.title("Settings")
-    symbol       = st.selectbox("Asset", ["BTC", "ETH", "SOL", "DOGE"], index=0)
-    horizon      = st.slider("Contract horizon (min)", 5, 30, 15)
+    symbol       = "BTC"
+    st.text_input("Asset", value=symbol, disabled=True)
+    horizon      = st.slider("Contract horizon (min)", 15, 240, 60)
     bankroll     = st.number_input("Bankroll ($)", min_value=100, value=1000, step=100)
-    vol_window   = st.slider("Vol estimation window (min)", 10, 120, 60)
+    vol_window   = st.slider("Vol estimation window (hourly candles)", 24, 120, 60)
     alert_threshold = st.slider("Alert edge threshold (%)", 3, 20, 8)
-    auto_refresh = st.checkbox("Auto-refresh every 10s", value=True)
+    auto_refresh = st.checkbox("Auto-refresh every 30s", value=True)
 
     st.divider()
-    st.caption("Data: Robinhood (live price) + yfinance (1-min candles)")
-    st.caption("Model: GARCH vol + momentum drift + Student-t tails")
+    st.caption("Data: Robinhood (live price) + yfinance (1-hour candles)")
+    st.caption("Model: blended vol + calibration + momentum + Student-t tails")
 
 # ---------------------------------------------------------------------------
 # Header
@@ -120,12 +177,21 @@ if "error" in price_data:
     st.stop()
 
 current_price = price_data["price"]
+if price_data.get("warning"):
+    st.warning(f"Robinhood unavailable; using yfinance price. {price_data['warning']}")
 
 try:
-    df_intraday, annual_vol, annual_drift, vol_source, tail_dof, signal_details = get_intraday(symbol)
+    df_intraday, annual_vol, annual_drift, vol_source, tail_dof, signal_details, calibration, vol_est = get_intraday(
+        symbol, vol_window=vol_window, horizon=horizon
+    )
 except Exception as e:
     st.error(f"Could not fetch intraday data: {e}")
     st.stop()
+
+# Funding rate (Binance perp) — contrarian drift component
+funding_rate, funding_drift, funding_status = get_funding(symbol)
+# Blend: 75% chart/momentum signal + 25% funding rate contrarian signal
+annual_drift = annual_drift * 0.75 + funding_drift * 0.25
 
 from stock_agent.prediction_market import sigma_over_horizon
 sig_T = sigma_over_horizon(annual_vol, horizon)
@@ -153,7 +219,7 @@ else:
 # Top metrics row
 # ---------------------------------------------------------------------------
 
-col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 col1.metric("BTC Live Price",  f"${current_price:,.2f}")
 col2.metric("Bid",             f"${price_data['bid']:,.2f}" if price_data.get("bid") else "N/A")
 col3.metric("Ask",             f"${price_data['ask']:,.2f}" if price_data.get("ask") else "N/A")
@@ -161,14 +227,30 @@ col4.metric(f"Vol ({vol_source})", f"{annual_vol:.1%} p.a.")
 col5.metric(f"{horizon}-min Sigma", f"{sig_T:.3%}")
 col6.metric("Momentum", drift_label, delta=drift_delta)
 
+# Funding rate metric — positive = longs overcrowded (bearish), negative = shorts overcrowded (bullish)
+if funding_status == "ok":
+    funding_pct = f"{funding_rate*100:.4f}%"
+    funding_bias = "Bearish" if funding_rate > 0.0002 else ("Bullish" if funding_rate < 0 else "Neutral")
+    col7.metric("Funding (8h)", funding_pct, delta=funding_bias,
+                delta_color="inverse")   # positive funding = bearish = red
+else:
+    col7.metric("Funding (8h)", "N/A")
+
 dof_display = f"{tail_dof:.1f}" if tail_dof < 30 else "Normal"
+calibration_display = (
+    f"{calibration.samples} samples, Brier {calibration.brier:.3f}"
+    if calibration.samples
+    else "unavailable"
+)
 st.caption(
+    f"Calibration: {calibration_display}  |  "
     f"Tail model: Student-t dof={dof_display}  |  "
     f"{'Fatter tails — OTM probabilities boosted' if tail_dof < 15 else 'Near-normal tails'}  |  "
     f"EMA cross: **{signal_details['ema_cross']}**  |  "
     f"Price: {signal_details['price_pos']}  |  "
     f"Vol factor: {signal_details['vol_factor']:.2f}x  |  "
-    f"EMA9: ${signal_details['ema9']:,.0f}  EMA21: ${signal_details['ema21']:,.0f}"
+    f"EMA9: ${signal_details['ema9']:,.0f}  EMA21: ${signal_details['ema21']:,.0f}  |  "
+    f"Funding drift: {funding_drift:+.1f}  |  Blended drift: {annual_drift:+.1f}"
 )
 
 # ---------------------------------------------------------------------------
@@ -182,6 +264,8 @@ if "watchlist" not in st.session_state:
     st.session_state["watchlist"] = {}
 if "alerted" not in st.session_state:
     st.session_state["alerted"] = set()
+if "kxbtcd_markets" not in st.session_state:
+    st.session_state["kxbtcd_markets"] = []
 
 _tp_watch = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
                         max_position_pct=0.10, min_edge_pct=0.0,
@@ -190,7 +274,7 @@ _tp_watch = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
 if st.session_state["watchlist"]:
     watch_decisions = _scan(symbol, current_price, annual_vol,
                             st.session_state["watchlist"], horizon,
-                            _tp_watch, annual_drift, tail_dof)
+                            _tp_watch, annual_drift, tail_dof, calibration)
     hot = [d for d in watch_decisions
            if abs(d.net_edge) >= alert_threshold / 100 and d.signal != Signal.HOLD]
 
@@ -207,7 +291,7 @@ if st.session_state["watchlist"]:
         act = "BUY YES" if top.signal == Signal.BUY else "BUY NO"
         st.success(
             f"**ALERT — {act}**  |  Strike ${top.strike:,.2f}  |  "
-            f"Fair {top.fair_prob:.1%}  vs  Market {top.contract_price_pct:.1%}  |  "
+            f"Cal {top.fair_prob:.1%}  vs  Market {top.contract_price_pct:.1%}  |  "
             f"Edge {top.net_edge:+.1%}  |  Size ${top.sized_dollars:,.0f}"
         )
 else:
@@ -224,7 +308,7 @@ left, right = st.columns([3, 2], gap="large")
 
 # ---- Price chart -----------------------------------------------------------
 with left:
-    st.subheader("Price Action (1-min candles)")
+    st.subheader("Price Action (1-hour candles)")
 
     # EMAs
     df_chart = df_intraday.copy()
@@ -320,7 +404,8 @@ with left:
 
     # Probability distribution chart
     st.subheader("Fair Probability Distribution")
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift, tail_dof)
+    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon,
+                                annual_drift, tail_dof, calibration)
     strikes   = [r["strike"] for r in ladder_rows]
     p_yes_vals = [r["fair_yes"] * 100 for r in ladder_rows]
 
@@ -353,17 +438,19 @@ with right:
     st.subheader("Probability Ladder")
     st.caption("Compare these to Robinhood's contract prices to find edge.")
 
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon, annual_drift, tail_dof)
+    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon,
+                                annual_drift, tail_dof, calibration)
     df_ladder = pd.DataFrame(ladder_rows)
     df_ladder["Strike"]  = df_ladder["strike"].map(lambda x: f"${x:,.2f}")
-    df_ladder["P(Yes)"]  = df_ladder["fair_yes"].map(lambda x: f"{x:.1%}")
+    df_ladder["Raw"]     = df_ladder["raw_fair_yes"].map(lambda x: f"{x:.1%}")
+    df_ladder["Cal"]     = df_ladder["fair_yes"].map(lambda x: f"{x:.1%}")
     df_ladder["P(No)"]   = df_ladder["fair_no"].map(lambda x: f"{x:.1%}")
     df_ladder["ATM"]     = df_ladder["strike"].map(
         lambda x: "<<" if abs(x - current_price) / current_price < 0.002 else ""
     )
 
     st.dataframe(
-        df_ladder[["Strike", "P(Yes)", "P(No)", "ATM"]],
+        df_ladder[["Strike", "Raw", "Cal", "P(No)", "ATM"]],
         use_container_width=True,
         hide_index=True,
         height=350,
@@ -384,7 +471,7 @@ with right:
                                        step=1, key="yes_price_val")
 
     if st.button("Analyze Contract", type="primary", use_container_width=True):
-        from stock_agent.prediction_market import evaluate_contract
+        from stock_agent.prediction_market import evaluate_contract, evaluate_range_contract
         from stock_agent.trading import TradeParams, Signal
 
         tp = TradeParams(
@@ -395,7 +482,8 @@ with right:
             transaction_cost_pct=0.02,
         )
         d = evaluate_contract(symbol, strike_input, yes_price_input,
-                              current_price, annual_vol, horizon, tp, annual_drift, tail_dof)
+                              current_price, annual_vol, horizon, tp, annual_drift,
+                              tail_dof, calibration)
 
         # Result card
         if d.signal == Signal.BUY:
@@ -408,68 +496,292 @@ with right:
             color = "off"
             action = "HOLD — edge too thin"
 
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Fair P(Yes)", f"{d.fair_prob:.1%}")
-        r2.metric("Net Edge",    f"{d.net_edge:+.1%}")
-        r3.metric("Size",        f"${d.sized_dollars:,.0f}")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Raw P(Yes)", f"{(d.raw_fair_prob or d.fair_prob):.1%}")
+        r2.metric("Cal P(Yes)", f"{d.fair_prob:.1%}")
+        r3.metric("Net Edge",   f"{d.net_edge:+.1%}")
+        r4.metric("Size",       f"${d.sized_dollars:,.0f}")
 
         if d.signal != Signal.HOLD:
             st.success(f"**{action}** — edge {d.net_edge:+.1%} vs market")
         else:
             st.warning(f"**HOLD** — edge {d.raw_edge:+.1%} is too thin after spread")
 
-    # ---- Batch scan --------------------------------------------------------
     st.divider()
-    st.subheader("Scan Multiple Contracts")
-    st.caption('Format: "strike:yes_price, strike:yes_price"')
+    st.subheader("Evaluate Kalshi")
 
-    batch_input = st.text_input(
-        "Contracts",
-        placeholder="76385:61, 76500:45, 76200:72",
+    # -- KXBTCD hourly event (fastest path for 1-hour trading) ---------------
+    st.caption("**Quick: KXBTCD hourly event** — fetches all near-ATM strikes for a specific hour")
+    kx_col1, kx_col2 = st.columns([1, 2])
+    kxbtcd_hour = kx_col1.number_input("Expiry hour (ET, 24h)", min_value=0, max_value=23, value=11)
+    if kx_col2.button("Load KXBTCD ATM Contracts", use_container_width=True):
+        try:
+            from stock_agent.kalshi_market import find_kxbtcd_atm_markets
+            st.session_state["kxbtcd_markets"] = find_kxbtcd_atm_markets(
+                current_price, hour_et=kxbtcd_hour
+            )
+            if not st.session_state["kxbtcd_markets"]:
+                st.warning(f"No open KXBTCD markets found for {kxbtcd_hour:02d}:00 ET today.")
+        except Exception as e:
+            st.error(f"KXBTCD load failed: {e}")
+
+    if st.session_state.get("kxbtcd_markets"):
+        from stock_agent.prediction_market import evaluate_range_contract
+        from stock_agent.trading import TradeParams, Signal
+
+        tp_kx = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
+                            max_position_pct=0.10, min_edge_pct=0.03,
+                            transaction_cost_pct=0.02)
+        kx_rows = []
+        for m in st.session_state["kxbtcd_markets"]:
+            price = m.get("display_price_cents")
+            if price is None:
+                continue
+            try:
+                d = evaluate_range_contract(
+                    symbol, m.get("floor_strike"), m.get("cap_strike"),
+                    float(price), current_price, annual_vol,
+                    horizon, tp_kx, annual_drift, tail_dof,
+                )
+                action = "BUY YES" if d.signal == Signal.BUY else (
+                    "BUY NO" if d.signal == Signal.SELL else "HOLD"
+                )
+                kx_rows.append({
+                    "Ticker":   m["ticker"],
+                    "Floor":    f"${m.get('floor_strike') or 0:,.0f}",
+                    "Min Left": f"{m.get('minutes_left', '?')}",
+                    "Kalshi":   f"{price:.1f}c",
+                    "Fair":     f"{d.fair_prob:.1%}",
+                    "Edge":     f"{d.net_edge:+.1%}",
+                    "Action":   action,
+                })
+            except Exception:
+                continue
+        if kx_rows:
+            st.dataframe(pd.DataFrame(kx_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("KXBTCD markets loaded but no orderbook prices available yet.")
+
+    st.divider()
+    kalshi_horizon_filter = st.selectbox(
+        "Show markets expiring within",
+        ["1 hour", "2 hours", "6 hours", "Any"],
+        index=1,
+    )
+    _horizon_map = {"1 hour": 1.0, "2 hours": 2.0, "6 hours": 6.0, "Any": None}
+    _kalshi_max_h = _horizon_map[kalshi_horizon_filter]
+
+    if st.button("Find Open BTC Kalshi Markets", use_container_width=True):
+        try:
+            st.session_state["kalshi_btc_markets"] = get_kalshi_btc_markets(
+                max_expiry_hours=_kalshi_max_h
+            )
+            if not st.session_state["kalshi_btc_markets"]:
+                st.info(f"No open BTC markets expiring within {kalshi_horizon_filter}. Try a wider filter.")
+        except Exception as e:
+            st.error(f"Could not search Kalshi BTC markets: {e}")
+
+    if st.session_state.get("kalshi_btc_markets"):
+        from stock_agent.prediction_market import evaluate_range_contract
+        from stock_agent.trading import TradeParams, Signal
+
+        sorted_markets = sorted(
+            st.session_state["kalshi_btc_markets"],
+            key=lambda m: (
+                abs((m.get("strike") or current_price) - current_price),
+                m.get("ticker", ""),
+            ),
+        )
+        quoted_markets = get_kalshi_btc_quotes(sorted_markets[:24])
+        scan_rows = []
+        tp_scan = TradeParams(
+            bankroll=bankroll,
+            kelly_fraction=0.25,
+            max_position_pct=0.10,
+            min_edge_pct=0.03,
+            transaction_cost_pct=0.02,
+        )
+        for market in quoted_markets[:12]:
+            try:
+                price = market["display_price_cents"]
+                if price is None:
+                    continue
+                d_scan = evaluate_range_contract(
+                    symbol,
+                    market.get("floor_strike"),
+                    market.get("cap_strike"),
+                    float(price),
+                    current_price,
+                    annual_vol,
+                    horizon,
+                    tp_scan,
+                    annual_drift,
+                    tail_dof,
+                )
+                action = "BUY YES" if d_scan.signal == Signal.BUY else (
+                    "BUY NO" if d_scan.signal == Signal.SELL else "HOLD"
+                )
+                scan_rows.append({
+                    "Ticker": market["ticker"],
+                    "Contract": d_scan.description or market.get("title", ""),
+                    "Kalshi": f"{price:.1f}c",
+                    "Fair": f"{d_scan.fair_prob:.1%}",
+                    "Edge": f"{d_scan.net_edge:+.1%}",
+                    "Action": action,
+                })
+            except Exception:
+                continue
+        if scan_rows:
+            st.dataframe(pd.DataFrame(scan_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Found BTC markets, but no usable orderbook prices yet.")
+
+    selected_kalshi_ticker = None
+    if st.session_state.get("kalshi_btc_markets"):
+        options = sorted(
+            st.session_state["kalshi_btc_markets"],
+            key=lambda m: (
+                abs((m.get("strike") or current_price) - current_price),
+                m.get("ticker", ""),
+            ),
+        )
+        labels = [
+            f"{m['ticker']} | "
+            f"{('$' + format(m['strike'], ',.0f')) if m.get('strike') is not None else 'range'} | "
+            f"{str(round(m['minutes_left'])) + ' min' if m.get('minutes_left') is not None else m.get('close_time', '')}"
+            for m in options
+        ]
+        selected_label = st.selectbox("Open BTC markets", labels)
+        selected_kalshi_ticker = options[labels.index(selected_label)]["ticker"]
+
+    kalshi_ticker = st.text_input(
+        "Kalshi market ticker",
+        value=selected_kalshi_ticker or "",
+        placeholder="KXBTC...",
+        key="kalshi_ticker",
+    )
+    active_kalshi_ticker = kalshi_ticker or selected_kalshi_ticker
+    if st.button("Fetch Kalshi Price", use_container_width=True) and active_kalshi_ticker:
+        from stock_agent.prediction_market import evaluate_contract
+        from stock_agent.trading import TradeParams, Signal
+
+        try:
+            q = get_kalshi_quote(active_kalshi_ticker)
+            k_price = q["display_price_cents"]
+            if k_price is None:
+                st.error("Kalshi orderbook has no usable Yes price.")
+            else:
+                st.caption(q["title"])
+                st.write(
+                    f"Yes bid/ask/mid: "
+                    f"{q['yes_bid_cents'] if q['yes_bid_cents'] is not None else 'N/A'} / "
+                    f"{q['yes_ask_cents'] if q['yes_ask_cents'] is not None else 'N/A'} / "
+                    f"{q['yes_mid_cents'] if q['yes_mid_cents'] is not None else 'N/A'} cents"
+                )
+                tp = TradeParams(
+                    bankroll=bankroll,
+                    kelly_fraction=0.25,
+                    max_position_pct=0.10,
+                    min_edge_pct=0.03,
+                    transaction_cost_pct=0.02,
+                )
+                if q["floor_strike"] is not None or q["cap_strike"] is not None:
+                    d = evaluate_range_contract(symbol, q["floor_strike"], q["cap_strike"],
+                                                float(k_price), current_price, annual_vol,
+                                                horizon, tp, annual_drift, tail_dof)
+                else:
+                    k_strike = q["strike"] or strike_input
+                    d = evaluate_contract(symbol, float(k_strike), float(k_price),
+                                          current_price, annual_vol, horizon, tp,
+                                          annual_drift, tail_dof, calibration)
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Raw P(Yes)", f"{(d.raw_fair_prob or d.fair_prob):.1%}")
+                r2.metric("Cal P(Yes)", f"{d.fair_prob:.1%}")
+                r3.metric("Kalshi Mid", f"{k_price:.1f}c")
+                r4.metric("Net Edge", f"{d.net_edge:+.1%}")
+                if d.signal != Signal.HOLD:
+                    action = "BUY YES" if d.signal == Signal.BUY else "BUY NO"
+                    st.success(f"**{action}** - edge {d.net_edge:+.1%}, size ${d.sized_dollars:,.0f}")
+                else:
+                    st.warning(f"**HOLD** - edge {d.raw_edge:+.1%} is too thin after spread")
+        except Exception as e:
+            st.error(f"Could not fetch Kalshi market: {e}")
+
+    # ---- Quick Scan (mirrors Robinhood hourly contract grid) ---------------
+    st.divider()
+    st.subheader("Quick Scan")
+    st.caption("Strikes auto-set at $100 increments. Fill in Yes prices from Robinhood, then Scan.")
+
+    # Generate 7 strikes at $100 increments centred on spot
+    base = round(current_price / 100) * 100
+    qs_strikes = [base + (i - 3) * 100 for i in range(7)]   # base-300 … base+300
+
+    # Editable grid: user fills Yes price (default 50) for each strike
+    qs_df = pd.DataFrame({
+        "Strike ($)": [f"{int(s):,}" for s in qs_strikes],
+        "Yes price (¢)": [50] * 7,
+    })
+    edited = st.data_editor(
+        qs_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Strike ($)":      st.column_config.TextColumn(disabled=True),
+            "Yes price (¢)":   st.column_config.NumberColumn(min_value=1, max_value=99, step=1),
+        },
+        key="quick_scan_grid",
     )
 
-    if st.button("Scan All", use_container_width=True) and batch_input:
+    if st.button("Scan All", use_container_width=True, type="primary"):
         from stock_agent.prediction_market import scan_contracts
         from stock_agent.trading import TradeParams, Signal
 
         tp = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
                          max_position_pct=0.10, min_edge_pct=0.03,
                          transaction_cost_pct=0.02)
-        try:
-            contracts = {
-                float(item.split(":")[0].strip()): float(item.split(":")[1].strip())
-                for item in batch_input.split(",")
-            }
-            decisions = scan_contracts(symbol, current_price, annual_vol,
-                                       contracts, horizon, tp, annual_drift, tail_dof)
 
-            rows = []
-            for d in decisions:
-                rows.append({
-                    "Strike":   f"${d.strike:,.2f}",
-                    "Fair":     f"{d.fair_prob:.1%}",
-                    "Market":   f"{d.contract_price_pct:.1%}",
-                    "Edge":     f"{d.net_edge:+.1%}",
-                    "Signal":   d.signal.value,
-                    "Action":   f"BUY {'YES' if d.signal==Signal.BUY else 'NO'}  ${d.sized_dollars:,.0f}" if d.signal != Signal.HOLD else "HOLD",
-                })
+        contracts = {
+            qs_strikes[i]: float(edited.iloc[i]["Yes price (¢)"])
+            for i in range(len(qs_strikes))
+        }
+        decisions = scan_contracts(symbol, current_price, annual_vol,
+                                   contracts, horizon, tp, annual_drift, tail_dof,
+                                   calibration)
 
-            df_scan = pd.DataFrame(rows)
+        result_rows = []
+        for d in decisions:
+            if d.signal == Signal.BUY:
+                action = f"BUY YES  ${d.sized_dollars:,.0f}"
+                bg = "#1a6644"
+            elif d.signal == Signal.SELL:
+                action = f"BUY NO   ${d.sized_dollars:,.0f}"
+                bg = "#7a1a2e"
+            else:
+                action = "HOLD"
+                bg = ""
+            result_rows.append({
+                "Strike":   f"${d.strike:,.0f}",
+                "Raw":      f"{(d.raw_fair_prob or d.fair_prob):.0%}",
+                "Cal":      f"{d.fair_prob:.0%}",
+                "Mkt":      f"{d.contract_price_pct:.0%}",
+                "Edge":     f"{d.net_edge:+.0%}",
+                "Action":   action,
+                "_bg":      bg,
+            })
 
-            def highlight_signal(row):
-                if "BUY" in row["Signal"]:
-                    return ["background-color: #0d3d2e"] * len(row)
-                if "SELL" in row["Signal"]:
-                    return ["background-color: #3d0d0d"] * len(row)
-                return [""] * len(row)
+        df_result = pd.DataFrame(result_rows)
+        bg_colors = df_result["_bg"].tolist()
+        df_display = df_result.drop(columns=["_bg"])
 
-            st.dataframe(
-                df_scan.style.apply(highlight_signal, axis=1),
-                use_container_width=True,
-                hide_index=True,
-            )
-        except Exception as e:
-            st.error(f"Parse error: {e}. Use format: 76385:61, 76500:45")
+        def _hl(row):
+            bg = bg_colors[row.name]
+            return [f"background-color: {bg}; color: white" if bg else ""] * len(row)
+
+        st.dataframe(
+            df_display.style.apply(_hl, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 # ---------------------------------------------------------------------------
 # Contract Watchlist (full-width, auto-scanned every refresh)
@@ -477,7 +789,7 @@ with right:
 
 st.divider()
 st.subheader("Contract Watchlist")
-st.caption(f"Re-evaluated every 10s. Alert fires when edge >= {alert_threshold}%.")
+st.caption(f"Re-evaluated every 30s. Alert fires when edge >= {alert_threshold}%.")
 
 wa, wb, wc = st.columns([3, 1, 1])
 wl_input = wa.text_input("Add contract (strike:yes_price)",
@@ -503,7 +815,8 @@ if watch_decisions:
         wl_rows.append({
             "Strike":   f"${d.strike:,.2f}",
             "Yes (c)":  int(orig_price),
-            "Fair":     f"{d.fair_prob:.1%}",
+            "Raw":      f"{(d.raw_fair_prob or d.fair_prob):.1%}",
+            "Cal":      f"{d.fair_prob:.1%}",
             "Market":   f"{d.contract_price_pct:.1%}",
             "Edge":     f"{d.net_edge:+.1%}",
             "Signal":   d.signal.value,
@@ -545,5 +858,5 @@ else:
 # ---------------------------------------------------------------------------
 
 if auto_refresh:
-    time.sleep(10)
+    time.sleep(30)
     st.rerun()
