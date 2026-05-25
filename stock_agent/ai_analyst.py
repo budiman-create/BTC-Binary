@@ -158,6 +158,18 @@ def analyse(
     return _parse_response(state.ticker, raw)
 
 
+def _time_urgency(minutes_left: float) -> str:
+    if minutes_left <= 10:
+        return "FINAL MINUTES — price is essentially locked in; only a sudden spike/dump changes outcome"
+    if minutes_left <= 20:
+        return "VERY SHORT — momentum and current price position dominate; drift is irrelevant"
+    if minutes_left <= 35:
+        return "SHORT — price action and vol matter most; light macro influence"
+    if minutes_left <= 50:
+        return "MODERATE — balanced mix of momentum, vol, and sentiment"
+    return "STANDARD — full drift + vol + sentiment all relevant"
+
+
 def _build_btc_prompt(
     symbol: str,
     current_price: float,
@@ -169,42 +181,78 @@ def _build_btc_prompt(
     funding_rate: float,
     tail_dof: float,
     horizon_minutes: int,
+    minutes_left: float | None,
+    price_1h_ago: float | None,
+    price_2h_ago: float | None,
     extra_context: str = "",
     contracts_context: str = "",
 ) -> str:
+    import math
+
     funding_bias = (
         "overcrowded long (bearish)" if funding_rate > 0.0002
         else "overcrowded short (bullish)" if funding_rate < 0
         else "neutral"
     )
 
+    # Time-on-clock block
+    effective_min = minutes_left if minutes_left is not None else float(horizon_minutes)
+    urgency = _time_urgency(effective_min)
+    # sigma scaled to actual time remaining
+    minutes_per_year = 525_600
+    sigma_to_expiry = annual_vol * math.sqrt(effective_min / minutes_per_year)
+
+    time_block = (
+        f"\nTIME ON CLOCK:\n"
+        f"  Minutes to expiry : {effective_min:.0f} min\n"
+        f"  Urgency regime    : {urgency}\n"
+        f"  Sigma to expiry   : {sigma_to_expiry:.3%}  "
+        f"(1-sigma move = ${current_price * sigma_to_expiry:,.0f})\n"
+    )
+
+    # Price action block
+    pa_lines = ["\nPRICE ACTION (1h candles):"]
+    pa_lines.append(f"  Now       : ${current_price:,.2f}")
+    if price_1h_ago:
+        chg_1h = (current_price - price_1h_ago) / price_1h_ago
+        direction = "RISING" if chg_1h > 0.001 else ("FALLING" if chg_1h < -0.001 else "FLAT")
+        pa_lines.append(f"  1h ago    : ${price_1h_ago:,.2f}  ({chg_1h:+.3%} -> {direction})")
+    if price_2h_ago and price_1h_ago:
+        chg_prev = (price_1h_ago - price_2h_ago) / price_2h_ago
+        accel = chg_1h - chg_prev  # type: ignore[possibly-unbound]
+        accel_str = "ACCELERATING" if accel > 0.001 else ("DECELERATING" if accel < -0.001 else "STEADY")
+        pa_lines.append(f"  2h ago    : ${price_2h_ago:,.2f}  (prev hour {chg_prev:+.3%} -> momentum {accel_str})")
+    price_action_block = "\n".join(pa_lines)
+
     contract_block = ""
     action_field = ""
     if contracts_context:
         contract_block = f"\n{contracts_context}\n"
         action_field = (
-            "\nACTION: <pick the single best contract from the table above and explain why, "
-            "or say SKIP if news/sentiment overrides the model edge. "
-            "Format: 'BUY YES $X strike — reason' or 'SKIP — reason'>"
+            "\nACTION: <given the TIME REMAINING and PRICE ACTION DIRECTION, pick the single best "
+            "contract or say SKIP. State whether BTC is heading toward or away from the strike. "
+            "Format: 'BUY YES $X — BTC heading [toward/away], N min left, edge holds because ...' "
+            "or 'SKIP — reason'>"
         )
 
     return f"""You are a senior crypto analyst specialising in short-term BTC binary contracts.
-Analyse the data below and return a structured assessment for a {horizon_minutes}-minute horizon.
+Your analysis must be tightly focused on the 1-HOUR window. Ignore multi-day fundamentals.
+Price action and time remaining are the PRIMARY inputs. Drift and macro are secondary.
 
 ASSET: {symbol}
-Current price: ${current_price:,.2f}
-Horizon: {horizon_minutes} minutes
-Annualised vol: {annual_vol:.1%}
-Blended drift signal: {annual_drift:+.2f} annualised
-EMA cross: {ema_cross}  |  Price position: {price_pos}  |  Vol factor: {vol_factor:.2f}x
-Funding rate (8h): {funding_rate*100:.4f}%  ->  {funding_bias}
-Tail fatness (dof): {tail_dof:.1f}  ({'fat tails' if tail_dof < 15 else 'near-normal'})
+Current price  : ${current_price:,.2f}
+Annualised vol : {annual_vol:.1%}
+Blended drift  : {annual_drift:+.2f} annualised
+EMA cross      : {ema_cross}  |  Price position: {price_pos}  |  Vol factor: {vol_factor:.2f}x
+Funding rate   : {funding_rate*100:.4f}%  ->  {funding_bias}
+Tail dof       : {tail_dof:.1f}  ({'fat tails' if tail_dof < 15 else 'near-normal'})
+{time_block}{price_action_block}
 
 {extra_context}{contract_block}
 Return your answer in EXACTLY this format (no extra text before or after):
 
-FUNDAMENTAL: <2-3 sentences on BTC short-term price action and trend quality>
-MACRO: <1-2 sentences on macro/sentiment context from the live data above>
+FUNDAMENTAL: <2-3 sentences focused on current price action and momentum within the 1h window>
+MACRO: <1 sentence on sentiment/news relevant to the next hour specifically>
 CATALYSTS: <bullet 1> | <bullet 2> | <bullet 3>
 RISKS: <bullet 1> | <bullet 2> | <bullet 3>
 BIAS: <one of: strongly_bullish / bullish / neutral / bearish / strongly_bearish>
@@ -223,6 +271,9 @@ def analyse_btc(
     funding_rate: float,
     tail_dof: float,
     horizon_minutes: int = 60,
+    minutes_left: float | None = None,
+    price_1h_ago: float | None = None,
+    price_2h_ago: float | None = None,
     contracts_context: str = "",
     groq_api_key: str | None = None,
     news_api_key: str | None = None,
@@ -231,8 +282,9 @@ def analyse_btc(
     """
     Analyse a BTC prediction market contract using live quant signals + news context.
 
-    Fetches Fear & Greed Index and CryptoPanic headlines automatically,
-    injects them into the LLM prompt, and returns (AnalystReport, raw_news_data).
+    minutes_left  : actual minutes to contract expiry (overrides horizon_minutes for urgency)
+    price_1h_ago  : BTC close price 1 hour ago (from intraday candles)
+    price_2h_ago  : BTC close price 2 hours ago
     """
     from .news_context import build_extra_context
 
@@ -248,7 +300,9 @@ def analyse_btc(
     prompt = _build_btc_prompt(
         symbol, current_price, annual_vol, annual_drift,
         ema_cross, price_pos, vol_factor, funding_rate,
-        tail_dof, horizon_minutes, extra_context, contracts_context,
+        tail_dof, horizon_minutes, minutes_left,
+        price_1h_ago, price_2h_ago,
+        extra_context, contracts_context,
     )
 
     client = Groq(api_key=key)

@@ -121,6 +121,9 @@ def get_ai_analysis(
     funding_rate: float,
     tail_dof: float,
     horizon: int,
+    minutes_left: float | None,
+    price_1h_ago: float | None,
+    price_2h_ago: float | None,
     contracts_context: str = "",
 ):
     from stock_agent.ai_analyst import analyse_btc
@@ -136,6 +139,9 @@ def get_ai_analysis(
             funding_rate=funding_rate,
             tail_dof=tail_dof,
             horizon_minutes=horizon,
+            minutes_left=minutes_left,
+            price_1h_ago=price_1h_ago,
+            price_2h_ago=price_2h_ago,
             contracts_context=contracts_context,
         )
         return report, raw_news, None
@@ -259,6 +265,21 @@ if "kxbtcd_markets" not in st.session_state:
 # ---------------------------------------------------------------------------
 _kx_evaluated: list[dict] = []
 _contracts_context = ""
+
+# Recent price history for AI time-awareness
+_close = df_intraday["Close"].squeeze()
+_price_1h_ago = float(_close.iloc[-2]) if len(_close) >= 2 else None
+_price_2h_ago = float(_close.iloc[-3]) if len(_close) >= 3 else None
+
+# Minutes left on the nearest-expiry contract (most urgent clock)
+_minutes_left: float | None = None
+if st.session_state.get("kxbtcd_markets"):
+    _ml_vals = [
+        m["minutes_left"] for m in st.session_state["kxbtcd_markets"]
+        if m.get("minutes_left") is not None
+    ]
+    if _ml_vals:
+        _minutes_left = min(_ml_vals)
 
 if st.session_state.get("kxbtcd_markets"):
     from stock_agent.prediction_market import evaluate_range_contract
@@ -436,6 +457,7 @@ with left:
         symbol, current_price, annual_vol, annual_drift,
         signal_details["ema_cross"], signal_details["price_pos"],
         signal_details["vol_factor"], funding_rate, tail_dof, horizon,
+        _minutes_left, _price_1h_ago, _price_2h_ago,
         _contracts_context,
     )
 
