@@ -248,14 +248,17 @@ calibration_display = (
     if calibration.samples
     else "unavailable"
 )
+_park_str = f"Parkinson: {vol_est.parkinson:.1%}" if vol_est.parkinson else "Parkinson: n/a"
+_garch_str = f"GARCH: {vol_est.garch:.1%}" if vol_est.garch else "GARCH: n/a"
 st.caption(
     f"Calibration: {calibration_display}  |  "
     f"Tail model: Student-t dof={dof_display}  |  "
-    f"{'Fatter tails — OTM probabilities boosted' if tail_dof < 15 else 'Near-normal tails'}  |  "
+    f"{'Fatter tails — OTM boosted' if tail_dof < 15 else 'Near-normal tails'}  |  "
+    f"Realised: {vol_est.realised:.1%}  EWMA: {vol_est.ewma:.1%}  "
+    f"{_park_str}  {_garch_str}  Blended: {annual_vol:.1%}  |  "
     f"EMA cross: **{signal_details['ema_cross']}**  |  "
     f"Price: {signal_details['price_pos']}  |  "
     f"Vol factor: {signal_details['vol_factor']:.2f}x  |  "
-    f"EMA9: ${signal_details['ema9']:,.0f}  EMA21: ${signal_details['ema21']:,.0f}  |  "
     f"Funding drift: {funding_drift:+.1f}  |  Blended drift: {annual_drift:+.1f}"
 )
 

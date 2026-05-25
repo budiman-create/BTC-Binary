@@ -143,6 +143,25 @@ def ewma_vol_annual(df: pd.DataFrame, span: int = 24) -> float:
     return vol_per_hour * math.sqrt(HOURS_PER_YEAR)
 
 
+def parkinson_vol_annual(df: pd.DataFrame, window: int = VOL_WINDOW) -> float:
+    """
+    Parkinson high-low range volatility estimator, annualised.
+
+    Uses each candle's High/Low range rather than close-to-close returns.
+    ~5x more statistically efficient — captures intraday swings that close-to-close misses.
+
+    Formula: σ² = (1 / (4n·ln2)) · Σ [ln(H_i/L_i)]²
+    """
+    high = df["High"].squeeze()
+    low  = df["Low"].squeeze()
+    n = min(window, len(high))
+    if n < 5:
+        raise ValueError("Not enough data for Parkinson vol.")
+    ln_hl = np.log(high.tail(n).values / low.tail(n).values)
+    var_per_hour = float(np.sum(ln_hl ** 2) / (4 * n * math.log(2)))
+    return math.sqrt(var_per_hour) * math.sqrt(HOURS_PER_YEAR)
+
+
 def garch_vol_annual(df: pd.DataFrame, window: int = VOL_WINDOW) -> float:
     """
     GARCH(1,1) one-step-ahead vol forecast, annualised.
@@ -171,6 +190,7 @@ class VolEstimate:
     ewma: float
     baseline: float
     garch: float | None
+    parkinson: float | None = None
 
 
 def blended_vol_annual(
@@ -179,22 +199,35 @@ def blended_vol_annual(
     baseline_window: int = BASELINE_WINDOW,
 ) -> VolEstimate:
     """
-    Blend fast, medium, model-based, and baseline volatility estimates.
+    Blend five volatility estimators.
 
-    GARCH is useful when available, but hourly contract probabilities should not
-    swing entirely on one estimator. Missing components are reweighted away.
+    Weights (when all available):
+      Parkinson 0.30 — high-low range, ~5x efficient, best intraday signal
+      GARCH     0.20 — captures vol clustering
+      EWMA      0.20 — responsive to recent moves
+      Realised  0.20 — classic close-to-close
+      Baseline  0.10 — slow anchor prevents over-reaction
+
+    Missing components are dropped and remaining weights renormalised.
     """
     components: list[tuple[str, float, float]] = []
 
     realised = realised_vol_annual(df, window=window)
-    ewma = ewma_vol_annual(df, span=max(8, min(window, 48)))
+    ewma     = ewma_vol_annual(df, span=max(8, min(window, 48)))
     baseline = realised_vol_annual(df, window=min(baseline_window, max(5, len(df) - 1)))
 
     components.extend([
-        ("realised", realised, 0.40),
-        ("ewma", ewma, 0.30),
+        ("realised", realised, 0.20),
+        ("ewma",     ewma,     0.20),
         ("baseline", baseline, 0.10),
     ])
+
+    parkinson: float | None
+    try:
+        parkinson = parkinson_vol_annual(df, window=window)
+        components.append(("parkinson", parkinson, 0.30))
+    except Exception:
+        parkinson = None
 
     garch: float | None
     try:
@@ -203,9 +236,18 @@ def blended_vol_annual(
     except Exception:
         garch = None
 
-    weight_sum = sum(weight for _, _, weight in components)
-    annual_vol = sum(value * weight for _, value, weight in components) / weight_sum
-    source = "Blend" if garch is not None else "Blend(no GARCH)"
+    weight_sum = sum(w for _, _, w in components)
+    annual_vol = sum(v * w for _, v, w in components) / weight_sum
+
+    active = {name for name, _, _ in components}
+    if "parkinson" in active and "garch" in active:
+        source = "Blend(P+G)"
+    elif "parkinson" in active:
+        source = "Blend(P)"
+    elif "garch" in active:
+        source = "Blend(G)"
+    else:
+        source = "Blend"
 
     return VolEstimate(
         annual_vol=float(annual_vol),
@@ -214,6 +256,7 @@ def blended_vol_annual(
         ewma=float(ewma),
         baseline=float(baseline),
         garch=None if garch is None else float(garch),
+        parkinson=None if parkinson is None else float(parkinson),
     )
 
 
