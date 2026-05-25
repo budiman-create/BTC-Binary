@@ -246,8 +246,7 @@ def attach_orderbook_quotes(markets: list[dict]) -> list[dict]:
 def _best_level_cents(levels: list | None) -> float | None:
     if not levels:
         return None
-    price = levels[0][0]
-    value = float(price)
+    value = max(float(level[0]) for level in levels)
     return value * 100.0 if value <= 1.0 else value
 
 
