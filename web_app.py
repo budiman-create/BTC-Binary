@@ -146,6 +146,7 @@ def get_ai_analysis(
     funding_rate: float,
     tail_dof: float,
     horizon: int,
+    contracts_context: str = "",
 ):
     from stock_agent.ai_analyst import analyse_btc
     try:
@@ -160,6 +161,7 @@ def get_ai_analysis(
             funding_rate=funding_rate,
             tail_dof=tail_dof,
             horizon_minutes=horizon,
+            contracts_context=contracts_context,
         )
         return report, raw_news, None
     except Exception as e:
@@ -276,6 +278,58 @@ st.caption(
 
 if "kxbtcd_markets" not in st.session_state:
     st.session_state["kxbtcd_markets"] = []
+
+# ---------------------------------------------------------------------------
+# Pre-compute KXBTCD contract evaluations (used by both right column + AI)
+# ---------------------------------------------------------------------------
+_kx_evaluated: list[dict] = []
+_contracts_context = ""
+
+if st.session_state.get("kxbtcd_markets"):
+    from stock_agent.prediction_market import evaluate_range_contract
+    from stock_agent.trading import TradeParams, Signal
+
+    _tp_kx = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
+                         max_position_pct=0.10, min_edge_pct=0.03,
+                         transaction_cost_pct=0.02)
+    for _m in st.session_state["kxbtcd_markets"]:
+        _price = _m.get("display_price_cents")
+        if _price is None:
+            continue
+        try:
+            _d = evaluate_range_contract(
+                symbol, _m.get("floor_strike"), _m.get("cap_strike"),
+                float(_price), current_price, annual_vol,
+                horizon, _tp_kx, annual_drift, tail_dof,
+            )
+            _action = "BUY YES" if _d.signal == Signal.BUY else (
+                "BUY NO" if _d.signal == Signal.SELL else "HOLD"
+            )
+            _kx_evaluated.append({
+                "ticker":      _m["ticker"],
+                "floor":       _m.get("floor_strike"),
+                "minutes_left": _m.get("minutes_left", "?"),
+                "kalshi_c":    float(_price),
+                "fair_pct":    _d.fair_prob,
+                "edge_pct":    _d.net_edge,
+                "action":      _action,
+                "sized":       _d.sized_dollars,
+                "decision":    _d,
+            })
+        except Exception:
+            continue
+
+    if _kx_evaluated:
+        rows_txt = ["--- KXBTCD contract table (model vs Kalshi market price) ---",
+                    f"{'Floor Strike':>12}  {'Kalshi':>7}  {'Fair':>7}  {'Edge':>7}  {'Min Left':>8}  Action"]
+        for r in _kx_evaluated:
+            rows_txt.append(
+                f"  ${r['floor']:>10,.0f}  {r['kalshi_c']:>5.1f}c  "
+                f"{r['fair_pct']:>6.1%}  {r['edge_pct']:>+6.1%}  "
+                f"{str(r['minutes_left']):>8}  {r['action']}"
+            )
+        rows_txt.append("--- End of contract table ---")
+        _contracts_context = "\n".join(rows_txt)
 
 st.divider()
 
@@ -407,6 +461,7 @@ with left:
         symbol, current_price, annual_vol, annual_drift,
         signal_details["ema_cross"], signal_details["price_pos"],
         signal_details["vol_factor"], funding_rate, tail_dof, horizon,
+        _contracts_context,
     )
 
     if ai_error:
@@ -436,7 +491,18 @@ with left:
             fg_col.metric("Fear & Greed", f"{fg['value']} — {fg['classification']}", delta=fg_delta,
                           delta_color="inverse" if fg["value"] > 60 else "normal")
 
-        with st.expander("Analyst report", expanded=True):
+        if report.contract_action:
+            action_upper = report.contract_action.upper()
+            if action_upper.startswith("SKIP"):
+                st.warning(f"**AI: {report.contract_action}**")
+            elif "BUY YES" in action_upper:
+                st.success(f"**AI: {report.contract_action}**")
+            elif "BUY NO" in action_upper:
+                st.error(f"**AI: {report.contract_action}**")
+            else:
+                st.info(f"**AI: {report.contract_action}**")
+
+        with st.expander("Analyst report", expanded=False):
             st.write(f"**Trend:** {report.fundamental_summary}")
             st.write(f"**Macro:** {report.macro_summary}")
             if report.key_catalysts:
@@ -493,42 +559,22 @@ with right:
         except Exception as e:
             st.error(f"KXBTCD load failed: {e}")
 
-    if st.session_state.get("kxbtcd_markets"):
-        from stock_agent.prediction_market import evaluate_range_contract
-        from stock_agent.trading import TradeParams, Signal
-
-        tp_kx = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
-                            max_position_pct=0.10, min_edge_pct=0.03,
-                            transaction_cost_pct=0.02)
-        kx_rows = []
-        for m in st.session_state["kxbtcd_markets"]:
-            price = m.get("display_price_cents")
-            if price is None:
-                continue
-            try:
-                d = evaluate_range_contract(
-                    symbol, m.get("floor_strike"), m.get("cap_strike"),
-                    float(price), current_price, annual_vol,
-                    horizon, tp_kx, annual_drift, tail_dof,
-                )
-                action = "BUY YES" if d.signal == Signal.BUY else (
-                    "BUY NO" if d.signal == Signal.SELL else "HOLD"
-                )
-                kx_rows.append({
-                    "Ticker":   m["ticker"],
-                    "Floor":    f"${m.get('floor_strike') or 0:,.0f}",
-                    "Min Left": f"{m.get('minutes_left', '?')}",
-                    "Kalshi":   f"{price:.1f}c",
-                    "Fair":     f"{d.fair_prob:.1%}",
-                    "Edge":     f"{d.net_edge:+.1%}",
-                    "Action":   action,
-                })
-            except Exception:
-                continue
-        if kx_rows:
-            st.dataframe(pd.DataFrame(kx_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("KXBTCD markets loaded but no orderbook prices available yet.")
+    if _kx_evaluated:
+        kx_rows = [
+            {
+                "Ticker":   r["ticker"],
+                "Floor":    f"${r['floor'] or 0:,.0f}",
+                "Min Left": f"{r['minutes_left']}",
+                "Kalshi":   f"{r['kalshi_c']:.1f}c",
+                "Fair":     f"{r['fair_pct']:.1%}",
+                "Edge":     f"{r['edge_pct']:+.1%}",
+                "Action":   r["action"],
+            }
+            for r in _kx_evaluated
+        ]
+        st.dataframe(pd.DataFrame(kx_rows), use_container_width=True, hide_index=True)
+    elif st.session_state.get("kxbtcd_markets"):
+        st.info("KXBTCD markets loaded but no orderbook prices available yet.")
 
     st.divider()
     kalshi_horizon_filter = st.selectbox(

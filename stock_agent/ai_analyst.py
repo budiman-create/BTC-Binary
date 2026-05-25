@@ -43,6 +43,7 @@ class AnalystReport:
     drift_bias: DriftBias
     drift_nudge: float
     confidence: str
+    contract_action: str      # specific contract recommendation when table is provided
     raw_response: str
 
     def print_report(self) -> None:
@@ -53,6 +54,8 @@ class AnalystReport:
         print(f"  Macro:       {self.macro_summary}")
         print(f"  Bias:        {self.drift_bias}  (drift nudge: {self.drift_nudge:+.1%} p.a.)")
         print(f"  Confidence:  {self.confidence}")
+        if self.contract_action:
+            print(f"  Action:      {self.contract_action}")
         if self.key_catalysts:
             print(f"  Catalysts:   " + "; ".join(self.key_catalysts))
         if self.key_risks:
@@ -114,6 +117,7 @@ def _parse_response(ticker: str, text: str) -> AnalystReport:
         drift_bias=bias,
         drift_nudge=DRIFT_NUDGE[bias],
         confidence=get("CONFIDENCE", "medium"),
+        contract_action=get("ACTION", ""),
         raw_response=text,
     )
 
@@ -166,12 +170,24 @@ def _build_btc_prompt(
     tail_dof: float,
     horizon_minutes: int,
     extra_context: str = "",
+    contracts_context: str = "",
 ) -> str:
     funding_bias = (
         "overcrowded long (bearish)" if funding_rate > 0.0002
         else "overcrowded short (bullish)" if funding_rate < 0
         else "neutral"
     )
+
+    contract_block = ""
+    action_field = ""
+    if contracts_context:
+        contract_block = f"\n{contracts_context}\n"
+        action_field = (
+            "\nACTION: <pick the single best contract from the table above and explain why, "
+            "or say SKIP if news/sentiment overrides the model edge. "
+            "Format: 'BUY YES $X strike — reason' or 'SKIP — reason'>"
+        )
+
     return f"""You are a senior crypto analyst specialising in short-term BTC binary contracts.
 Analyse the data below and return a structured assessment for a {horizon_minutes}-minute horizon.
 
@@ -181,11 +197,10 @@ Horizon: {horizon_minutes} minutes
 Annualised vol: {annual_vol:.1%}
 Blended drift signal: {annual_drift:+.2f} annualised
 EMA cross: {ema_cross}  |  Price position: {price_pos}  |  Vol factor: {vol_factor:.2f}x
-Funding rate (8h): {funding_rate*100:.4f}%  →  {funding_bias}
+Funding rate (8h): {funding_rate*100:.4f}%  ->  {funding_bias}
 Tail fatness (dof): {tail_dof:.1f}  ({'fat tails' if tail_dof < 15 else 'near-normal'})
 
-{extra_context}
-
+{extra_context}{contract_block}
 Return your answer in EXACTLY this format (no extra text before or after):
 
 FUNDAMENTAL: <2-3 sentences on BTC short-term price action and trend quality>
@@ -193,7 +208,7 @@ MACRO: <1-2 sentences on macro/sentiment context from the live data above>
 CATALYSTS: <bullet 1> | <bullet 2> | <bullet 3>
 RISKS: <bullet 1> | <bullet 2> | <bullet 3>
 BIAS: <one of: strongly_bullish / bullish / neutral / bearish / strongly_bearish>
-CONFIDENCE: <one of: high / medium / low>
+CONFIDENCE: <one of: high / medium / low>{action_field}
 """
 
 
@@ -208,6 +223,7 @@ def analyse_btc(
     funding_rate: float,
     tail_dof: float,
     horizon_minutes: int = 60,
+    contracts_context: str = "",
     groq_api_key: str | None = None,
     news_api_key: str | None = None,
     model: str = "llama-3.3-70b-versatile",
@@ -232,7 +248,7 @@ def analyse_btc(
     prompt = _build_btc_prompt(
         symbol, current_price, annual_vol, annual_drift,
         ema_cross, price_pos, vol_factor, funding_rate,
-        tail_dof, horizon_minutes, extra_context,
+        tail_dof, horizon_minutes, extra_context, contracts_context,
     )
 
     client = Groq(api_key=key)
