@@ -175,7 +175,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 st.title(f"BTC Prediction Market AI")
-st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}  |  Horizon: {horizon} min")
+st.caption(f"Last updated: {datetime.now(ZoneInfo('America/New_York')).strftime('%H:%M:%S ET')}  |  Horizon: {horizon} min")
 
 # ---------------------------------------------------------------------------
 # Fetch data
@@ -359,7 +359,7 @@ if st.session_state.get("kxbtcd_markets"):
     from stock_agent.trading import TradeParams, Signal
 
     _tp_kx = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
-                         max_position_pct=0.10, min_edge_pct=0.03,
+                         max_position_pct=0.10, min_edge_pct=0.15,
                          transaction_cost_pct=0.02)
     for _m in st.session_state["kxbtcd_markets"]:
         if not _market_is_live(_m):
@@ -575,18 +575,17 @@ with left:
             else:
                 st.info(f"**AI: {report.contract_action}**")
 
-        # Auto-log one live directional recommendation per contract side.
-        _action_upper = (report.contract_action or "").upper()
-        _ai_side = "YES" if "BUY YES" in _action_upper else ("NO" if "BUY NO" in _action_upper else None)
-        _best_contract = None
-        if _ai_side:
-            _best_contract = next(
-                (r for r in sorted(_kx_evaluated, key=lambda r: abs(r["edge_pct"]), reverse=True)
-                 if r["action"] == f"BUY {_ai_side}" and _market_is_live(r)),
-                None,
-            )
-        if _best_contract and _ai_side:
-            _log_fingerprint = f"{_best_contract['ticker']}|{_ai_side}"
+        # Auto-log: quant model picks the highest-edge actionable contract. AI is informational only.
+        _best_contract = next(
+            (r for r in sorted(_kx_evaluated, key=lambda r: r["edge_pct"], reverse=True)
+             if r["action"] in ("BUY YES", "BUY NO") and _market_is_live(r)),
+            None,
+        )
+        _quant_side = None
+        if _best_contract:
+            _quant_side = "YES" if _best_contract["action"] == "BUY YES" else "NO"
+        if _best_contract and _quant_side:
+            _log_fingerprint = f"{_best_contract['ticker']}|{_quant_side}"
             if st.session_state.get("last_log_fingerprint") != _log_fingerprint:
                 try:
                     from stock_agent.trade_log import is_contract_loggable, log_recommendation
@@ -608,21 +607,21 @@ with left:
                         kalshi_price_c=_best_contract["kalshi_c"],
                         fair_prob=_best_contract["fair_pct"],
                         edge=_best_contract["edge_pct"],
-                        ai_action=report.contract_action,
+                        ai_action=_best_contract["action"],
                         ai_confidence=report.confidence,
                         ai_bias=report.drift_bias,
                         minutes_left=_ml,
                         btc_price=current_price,
-                        side=_ai_side,
+                        side=_quant_side,
                     )
                     st.session_state["last_log_fingerprint"] = _log_fingerprint
-                    st.info(f"Auto-logged: {_best_contract['ticker']} — {report.contract_action[:40]}")
+                    st.info(f"Auto-logged: {_best_contract['ticker']} — {_best_contract['action']} (edge {_best_contract['edge_pct']:+.1%})")
                 except ValueError:
                     pass
                 except Exception as _log_err:
                     st.warning(f"Auto-log failed: {_log_err}")
             else:
-                st.caption(f"Already logged: {_best_contract['ticker']} — waiting for AI change or new contract")
+                st.caption(f"Already logged: {_best_contract['ticker']} — waiting for new contract")
 
         with st.expander("Analyst report", expanded=False):
             st.write(f"**Trend:** {report.fundamental_summary}")
@@ -740,9 +739,17 @@ try:
                 return "NO"
             return "—"
 
+        def _utc_to_et(ts: str) -> str:
+            try:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(
+                    ZoneInfo("America/New_York")
+                ).strftime("%m-%d %H:%M ET")
+            except Exception:
+                return ts[:16].replace("T", " ")
+
         log_df = pd.DataFrame([
             {
-                "Time (UTC)":  r.get("logged_at", "")[:16].replace("T", " "),
+                "Time (ET)":   _utc_to_et(r.get("logged_at", "")),
                 "Ticker":      r.get("ticker", ""),
                 "Floor":       f"${float(r['floor_strike']):,.0f}" if r.get("floor_strike") else "—",
                 "Kalshi":      f"{float(r['kalshi_price_c']):.1f}c" if r.get("kalshi_price_c") else "—",

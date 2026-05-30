@@ -18,16 +18,21 @@ import csv
 import os
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 from pathlib import Path
 
 LOG_PATH = Path(__file__).parent.parent / "trade_log.csv"
 
 COLUMNS = [
     "id", "logged_at", "ticker", "floor_strike", "close_time",
-    "kalshi_price_c", "fair_prob", "edge", "ai_action", "ai_confidence",
+    "kalshi_price_c", "fair_prob", "edge", "ai_action", "side", "log_key", "ai_confidence",
     "ai_bias", "minutes_left", "btc_price",
     "resolved", "resolved_yes", "ai_correct",
 ]
+
+MIN_LOG_MINUTES_LEFT = 45.0
 
 
 # ---------------------------------------------------------------------------
@@ -38,17 +43,31 @@ def _ensure_file() -> None:
     if not LOG_PATH.exists():
         with open(LOG_PATH, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=COLUMNS).writeheader()
+        return
+
+    with open(LOG_PATH, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        if all(col in fieldnames for col in COLUMNS):
+            return
+        rows = [_normalize_row(r) for r in reader]
+
+    with open(LOG_PATH, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
 
 
 def _read_all() -> list[dict]:
     _ensure_file()
     with open(LOG_PATH, newline="") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    return [_normalize_row(r) for r in rows]
 
 
 def _write_all(rows: list[dict]) -> None:
     with open(LOG_PATH, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
@@ -59,6 +78,63 @@ def _parse_bool(val: str) -> bool | None:
     if val in ("False", "false", "0"):
         return False
     return None
+
+
+def _normalize_row(row: dict) -> dict:
+    normalized = {col: row.get(col, "") for col in COLUMNS}
+    if not normalized.get("side"):
+        normalized["side"] = _infer_side(normalized.get("ai_action", "")) or ""
+    if not normalized.get("log_key") and normalized.get("ticker") and normalized.get("side"):
+        normalized["log_key"] = _make_log_key(normalized["ticker"], normalized["side"])
+    return normalized
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _infer_side(ai_action: str | None) -> str | None:
+    action = (ai_action or "").upper()
+    if "BUY YES" in action:
+        return "YES"
+    if "BUY NO" in action:
+        return "NO"
+    return None
+
+
+def _make_log_key(ticker: str, side: str) -> str:
+    return f"{ticker}|{side.upper()}"
+
+
+def _is_stale_logged_row(row: dict) -> bool:
+    logged_at = _parse_dt(row.get("logged_at"))
+    close_time = _parse_dt(row.get("close_time"))
+    return bool(logged_at and close_time and logged_at >= close_time)
+
+
+def is_contract_loggable(
+    close_time: str,
+    minutes_left: float | None,
+    min_minutes_left: float = MIN_LOG_MINUTES_LEFT,
+) -> tuple[bool, str]:
+    """Return whether a contract is still live enough to record a recommendation."""
+    close_dt = _parse_dt(close_time)
+    now = datetime.now(timezone.utc)
+    if close_dt is None:
+        return False, "missing or invalid close_time"
+    if close_dt <= now:
+        return False, "contract is already closed"
+    if minutes_left is not None and minutes_left < min_minutes_left:
+        return False, f"less than {min_minutes_left:g} minute left"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +153,26 @@ def log_recommendation(
     ai_bias: str,
     minutes_left: float | None,
     btc_price: float,
+    side: str | None = None,
 ) -> str:
     """Append a new recommendation row. Returns the new row id."""
     _ensure_file()
+    is_loggable, reason = is_contract_loggable(close_time, minutes_left)
+    if not is_loggable:
+        raise ValueError(f"not logging stale contract: {reason}")
+
+    side = (side or _infer_side(ai_action) or "").upper()
+    if side not in ("YES", "NO"):
+        raise ValueError("not logging non-directional recommendation")
+
+    log_key = _make_log_key(ticker, side)
+    rows = _read_all()
+    for existing in rows:
+        if existing.get("resolved") in ("True", "true"):
+            continue
+        if existing.get("log_key") == log_key:
+            return existing.get("id", "")
+
     row_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex[:6]
     row = {
         "id":             row_id,
@@ -91,6 +184,8 @@ def log_recommendation(
         "fair_prob":      round(fair_prob, 4),
         "edge":           round(edge, 4),
         "ai_action":      ai_action,
+        "side":           side,
+        "log_key":        log_key,
         "ai_confidence":  ai_confidence,
         "ai_bias":        ai_bias,
         "minutes_left":   round(minutes_left, 1) if minutes_left is not None else "",
@@ -100,7 +195,7 @@ def log_recommendation(
         "ai_correct":     "",
     }
     with open(LOG_PATH, "a", newline="") as f:
-        csv.DictWriter(f, fieldnames=COLUMNS).writerow(row)
+        csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore").writerow(row)
     return row_id
 
 
@@ -119,15 +214,18 @@ def check_and_mark_outcomes() -> int:
         ticker = row.get("ticker", "")
         if not ticker:
             continue
+        close_time = _parse_dt(row.get("close_time"))
+        if close_time and close_time > datetime.now(timezone.utc):
+            continue
         try:
             market = get_market(ticker)
             result = market.get("result")  # "yes" or "no" when resolved
             if result in ("yes", "no"):
                 resolved_yes = result == "yes"
-                action = row.get("ai_action", "").upper()
-                if "BUY YES" in action:
+                side = row.get("side") or _infer_side(row.get("ai_action", ""))
+                if side == "YES":
                     ai_correct = resolved_yes
-                elif "BUY NO" in action:
+                elif side == "NO":
                     ai_correct = not resolved_yes
                 else:
                     ai_correct = None   # SKIP/HOLD — no directional bet
@@ -144,9 +242,11 @@ def check_and_mark_outcomes() -> int:
     return updated
 
 
-def get_recent_history(n: int = 15) -> list[dict]:
-    """Return the last n rows (all, including unresolved), newest first."""
+def get_recent_history(n: int = 15, valid_only: bool = False) -> list[dict]:
+    """Return the last n rows, newest first."""
     rows = _read_all()
+    if valid_only:
+        rows = [r for r in rows if not _is_stale_logged_row(r)]
     return list(reversed(rows))[:n]
 
 
@@ -157,6 +257,7 @@ def accuracy_stats() -> dict:
         r for r in rows
         if r.get("resolved") in ("True", "true")
         and r.get("ai_correct") not in ("", None)
+        and not _is_stale_logged_row(r)
     ]
     if not resolved:
         return {"total": 0, "correct": 0, "win_rate": None,
@@ -188,6 +289,7 @@ def build_history_context(n: int = 10) -> str:
         r for r in rows
         if r.get("resolved") in ("True", "true")
         and r.get("ai_correct") not in ("", None)
+        and not _is_stale_logged_row(r)
     ]
     recent = list(reversed(resolved))[:n]
     if not recent:
@@ -204,7 +306,10 @@ def build_history_context(n: int = 10) -> str:
     ]
     lines.append(f"{'Date':>16}  {'Action':<10}  {'Edge':>6}  {'Min':>4}  {'Result':>8}  Correct")
     for r in recent:
-        logged = r.get("logged_at", "")[:16].replace("T", " ")
+        try:
+            logged = _parse_dt(r.get("logged_at", "")).astimezone(_ET).strftime("%m-%d %H:%M ET")
+        except Exception:
+            logged = r.get("logged_at", "")[:16].replace("T", " ")
         action = r.get("ai_action", "")[:9]
         edge   = f"{float(r['edge']):+.1%}" if r.get("edge") else "N/A"
         mins   = r.get("minutes_left", "?")
