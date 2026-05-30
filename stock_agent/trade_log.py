@@ -32,7 +32,15 @@ COLUMNS = [
     "resolved", "resolved_yes", "ai_correct",
 ]
 
-MIN_LOG_MINUTES_LEFT = 45.0
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+MIN_LOG_MINUTES_LEFT = _env_float("MIN_LOG_MINUTES_LEFT", 5.0)
+REPEAT_LOG_MINUTES = _env_float("REPEAT_LOG_MINUTES", 5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +128,14 @@ def _is_stale_logged_row(row: dict) -> bool:
     return bool(logged_at and close_time and logged_at >= close_time)
 
 
+def _recent_duplicate(existing: dict, now: datetime, repeat_minutes: float) -> bool:
+    logged_at = _parse_dt(existing.get("logged_at"))
+    if logged_at is None:
+        return True
+    age_minutes = (now - logged_at).total_seconds() / 60
+    return age_minutes < repeat_minutes
+
+
 def is_contract_loggable(
     close_time: str,
     minutes_left: float | None,
@@ -166,17 +182,18 @@ def log_recommendation(
         raise ValueError("not logging non-directional recommendation")
 
     log_key = _make_log_key(ticker, side)
+    now = datetime.now(timezone.utc)
     rows = _read_all()
     for existing in rows:
         if existing.get("resolved") in ("True", "true"):
             continue
-        if existing.get("log_key") == log_key:
+        if existing.get("log_key") == log_key and _recent_duplicate(existing, now, REPEAT_LOG_MINUTES):
             return existing.get("id", "")
 
-    row_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    row_id = now.strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex[:6]
     row = {
         "id":             row_id,
-        "logged_at":      datetime.now(timezone.utc).isoformat(),
+        "logged_at":      now.isoformat(),
         "ticker":         ticker,
         "floor_strike":   floor_strike or "",
         "close_time":     close_time,

@@ -16,6 +16,7 @@ Cron (every 5 min): */5 * * * * /home/ubuntu/BTC-Binary/.venv/bin/python /home/u
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -47,7 +48,16 @@ BANKROLL    = 1000
 KELLY       = 0.25
 MAX_POS_PCT = 0.10
 MIN_EDGE    = 0.15      # must match web_app TradeParams min_edge_pct
-MIN_MINUTES = 45.0      # must match trade_log.MIN_LOG_MINUTES_LEFT
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+MIN_MINUTES = _env_float("MIN_LOG_MINUTES_LEFT", 5.0)
 
 ET = ZoneInfo("America/New_York")
 
@@ -101,7 +111,7 @@ def load_contracts(current_price: float) -> list[dict]:
     now_et = datetime.now(ET)
     candidates: list[dict] = []
 
-    for offset in (1, 2):
+    for offset in (1, 2, 3):
         hour_et = (now_et.hour + offset) % 24
         try:
             markets = find_kxbtcd_atm_markets(current_price, hour_et=hour_et)
@@ -109,10 +119,32 @@ def load_contracts(current_price: float) -> list[dict]:
             log.warning(f"Could not load hour+{offset} markets: {e}")
             continue
 
-        live = [m for m in markets
+        quoted = [m for m in markets if m.get("display_price_cents") is not None]
+        live = [
+            m for m in quoted
+            if m.get("minutes_left") is not None
+            and float(m["minutes_left"]) >= MIN_MINUTES
+        ]
+        if markets:
+            minute_values = [
+                float(m["minutes_left"]) for m in markets
                 if m.get("minutes_left") is not None
-                and float(m["minutes_left"]) >= MIN_MINUTES
-                and m.get("display_price_cents") is not None]
+            ]
+            min_left = min(minute_values) if minute_values else None
+            max_left = max(minute_values) if minute_values else None
+            time_text = (
+                f"{min_left:.1f}-{max_left:.1f} min"
+                if min_left is not None and max_left is not None
+                else "unknown minutes"
+            )
+            log.info(
+                f"hour+{offset} {hour_et:02d}:00 ET: "
+                f"{len(markets)} markets, {len(quoted)} quoted, "
+                f"{len(live)} eligible >= {MIN_MINUTES:g} min ({time_text})"
+            )
+        else:
+            log.info(f"hour+{offset} {hour_et:02d}:00 ET: no markets found")
+
         candidates.extend(live)
         if live:
             log.info(f"Loaded {len(live)} live contracts for hour+{offset} ({hour_et:02d}:00 ET)")
@@ -180,6 +212,13 @@ def evaluate_contracts(
 
     actionable = [r for r in evaluated if r["action"] in ("BUY YES", "BUY NO")]
     log.info(f"Evaluated {len(evaluated)} contracts, {len(actionable)} actionable")
+    if evaluated:
+        best = max(evaluated, key=lambda r: r["edge_pct"])
+        log.info(
+            f"Best evaluated: {best['action']} {best['ticker']} "
+            f"edge={best['edge_pct']:+.1%} fair={best['fair_pct']:.1%} "
+            f"kalshi={best['kalshi_c']:.1f}c min_left={best['minutes_left']}"
+        )
     return evaluated
 
 
@@ -197,7 +236,7 @@ def log_best_signal(evaluated: list[dict]) -> None:
     )
 
     if not actionable:
-        log.info("No actionable signal — nothing logged")
+        log.info("No actionable signal - nothing logged")
         return
 
     best = actionable[0]
@@ -281,7 +320,7 @@ def main() -> None:
         return
 
     if not markets:
-        log.info("No contracts with ≥45 min left — nothing to evaluate")
+        log.info(f"No contracts with >= {MIN_MINUTES:g} min left and usable quotes - nothing to evaluate")
         log.info("=== worker done ===")
         return
 
