@@ -323,6 +323,28 @@ def _market_is_live(market: dict, min_minutes_left: float = 1.0) -> bool:
     return True
 
 
+def _ai_trade_side(contract_action: str | None) -> str | None:
+    action = (contract_action or "").upper()
+    if action.startswith("SKIP"):
+        return "SKIP"
+    if "BUY YES" in action:
+        return "YES"
+    if "BUY NO" in action:
+        return "NO"
+    return None
+
+
+def _ai_gate_reason(contract_action: str | None, quant_side: str) -> tuple[bool, str]:
+    ai_side = _ai_trade_side(contract_action)
+    if ai_side == "SKIP":
+        return False, "Gemini chose SKIP"
+    if ai_side is None:
+        return False, "Gemini did not give a clear BUY YES/BUY NO decision"
+    if ai_side != quant_side:
+        return False, f"Gemini chose {ai_side}, quant chose {quant_side}"
+    return True, f"Gemini approved {quant_side}"
+
+
 if "kxbtcd_markets" not in st.session_state:
     st.session_state["kxbtcd_markets"] = []
 
@@ -588,7 +610,7 @@ with left:
             else:
                 st.info(f"**AI: {report.contract_action}**")
 
-        # Auto-log: quant model picks the highest-edge actionable contract. AI is informational only.
+        # Auto-log: quant proposes the highest-edge contract; Gemini must approve the side.
         _best_contract = next(
             (r for r in sorted(_kx_evaluated, key=lambda r: r["edge_pct"], reverse=True)
              if r["action"] in ("BUY YES", "BUY NO") and _market_is_live(r)),
@@ -599,7 +621,13 @@ with left:
             _quant_side = "YES" if _best_contract["action"] == "BUY YES" else "NO"
         if _best_contract and _quant_side:
             _log_fingerprint = f"{_best_contract['ticker']}|{_quant_side}"
-            if st.session_state.get("last_log_fingerprint") != _log_fingerprint:
+            _ai_ok, _ai_gate_msg = _ai_gate_reason(report.contract_action, _quant_side)
+            st.caption(f"Quant: {_best_contract['action']} | AI gate: {_ai_gate_msg}")
+            from stock_agent.trade_log import REPEAT_LOG_MINUTES
+            _last_log_at = st.session_state.get("last_log_at_by_fingerprint", {}).get(_log_fingerprint, 0)
+            if not _ai_ok:
+                pass
+            elif (time.time() - _last_log_at) >= REPEAT_LOG_MINUTES * 60:
                 try:
                     from stock_agent.trade_log import is_contract_loggable, log_recommendation
                     _ml_raw = _best_contract.get("minutes_left")
@@ -611,7 +639,6 @@ with left:
                     _ok_to_log, _skip_reason = is_contract_loggable(_close_time, _ml)
                     if not _ok_to_log:
                         st.caption(f"Not logged: {_skip_reason}")
-                        st.session_state["last_log_fingerprint"] = _log_fingerprint
                         raise ValueError(_skip_reason)
                     _row_id = log_recommendation(
                         ticker=_best_contract["ticker"],
@@ -620,21 +647,26 @@ with left:
                         kalshi_price_c=_best_contract["kalshi_c"],
                         fair_prob=_best_contract["fair_pct"],
                         edge=_best_contract["edge_pct"],
-                        ai_action=_best_contract["action"],
+                        ai_action=report.contract_action or _best_contract["action"],
                         ai_confidence=report.confidence,
                         ai_bias=report.drift_bias,
                         minutes_left=_ml,
                         btc_price=current_price,
                         side=_quant_side,
                     )
-                    st.session_state["last_log_fingerprint"] = _log_fingerprint
+                    _last_logs = dict(st.session_state.get("last_log_at_by_fingerprint", {}))
+                    _last_logs[_log_fingerprint] = time.time()
+                    st.session_state["last_log_at_by_fingerprint"] = _last_logs
                     st.info(f"Auto-logged: {_best_contract['ticker']} — {_best_contract['action']} (edge {_best_contract['edge_pct']:+.1%})")
                 except ValueError:
                     pass
                 except Exception as _log_err:
                     st.warning(f"Auto-log failed: {_log_err}")
             else:
-                st.caption(f"Already logged: {_best_contract['ticker']} — waiting for new contract")
+                st.caption(
+                    f"Already logged: {_best_contract['ticker']} - "
+                    f"waiting {REPEAT_LOG_MINUTES:g} min repeat window"
+                )
 
         with st.expander("Analyst report", expanded=False):
             st.write(f"**Trend:** {report.fundamental_summary}")
