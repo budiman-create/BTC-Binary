@@ -110,7 +110,8 @@ def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: in
 
 
 
-@st.cache_data(ttl=600)   # 10 min — conserves Groq free-tier token quota (100k/day)
+_AI_CACHE_TTL = 900  # 15 min → 96 calls/day × 1900 tokens = ~182K tokens/day
+
 def get_ai_analysis(
     symbol: str,
     current_price: float,
@@ -128,6 +129,14 @@ def get_ai_analysis(
     contracts_context: str = "",
     history_context: str = "",
 ):
+    # Time-gated cache — ignores parameter changes within the TTL window.
+    # st.cache_data hashes all args, so any changing param (minutes_left,
+    # price_1h_ago, contracts_context…) busts it on every refresh. Using
+    # session_state with a timestamp is the only way to get a true TTL.
+    now = time.time()
+    if "ai_result" in st.session_state and (now - st.session_state.get("ai_ts", 0)) < _AI_CACHE_TTL:
+        return st.session_state["ai_result"]
+
     from stock_agent.ai_analyst import analyse_btc
     try:
         report, raw_news = analyse_btc(
@@ -147,9 +156,13 @@ def get_ai_analysis(
             contracts_context=contracts_context,
             history_context=history_context,
         )
-        return report, raw_news, None
+        result = (report, raw_news, None)
     except Exception as e:
-        return None, {}, str(e)
+        result = (None, {}, str(e))
+
+    st.session_state["ai_result"] = result
+    st.session_state["ai_ts"] = now
+    return result
 
 
 
@@ -526,8 +539,8 @@ with left:
     st.plotly_chart(fig2, use_container_width=True)
 
     # -- AI Analysis ----------------------------------------------------------
-    st.subheader("AI Analysis (Groq + Live News)")
-    st.caption("Llama-3.3-70b reads Fear & Greed + CryptoPanic headlines — refreshes every 10 min (auto-fallback to 8b-instant on rate limit)")
+    st.subheader("AI Analysis (Gemini Flash + Live News)")
+    st.caption("Gemini 1.5 Flash reads Fear & Greed + CryptoPanic headlines — refreshes every 15 min (auto-fallback to Flash-8B on rate limit)")
 
     report, raw_news, ai_error = get_ai_analysis(
         symbol, current_price, annual_vol, annual_drift,
