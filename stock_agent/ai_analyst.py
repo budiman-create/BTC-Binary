@@ -1,9 +1,9 @@
 """
-AI analyst layer — uses Google Gemini Flash (free tier) + live news context.
+AI analyst layer — uses Groq (free tier) + live news context.
 
-Free tier: 1,500 requests/day, 1M tokens/day — no credit card needed.
+Free tier: 500K tokens/day on llama-3.1-8b-instant (fast + light).
 Keys needed in .env:
-    GEMINI_API_KEY=...                (required — aistudio.google.com/apikey)
+    GROQ_API_KEY=gsk_...              (required — console.groq.com)
     CRYPTOPANIC_API_KEY=...           (optional — cryptopanic.com, free)
 """
 
@@ -13,8 +13,7 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
-from google import genai  # type: ignore
-from google.genai import types as genai_types  # type: ignore
+from groq import Groq  # type: ignore
 
 from .market_state import StockState
 
@@ -123,6 +122,16 @@ def _parse_response(ticker: str, text: str) -> AnalystReport:
     )
 
 
+def _groq_client(api_key: str | None = None) -> Groq:
+    key = api_key or os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise EnvironmentError(
+            "Set GROQ_API_KEY in your .env file.\n"
+            "Get a free key at: console.groq.com"
+        )
+    return Groq(api_key=key)
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -131,28 +140,23 @@ def analyse(
     state: StockState,
     extra_context: str = "",
     api_key: str | None = None,
-    model: str = "gemini-2.5-flash",
+    model: str = "llama-3.1-8b-instant",
 ) -> AnalystReport:
-    key = api_key or os.environ.get("GEMINI_API_KEY")
-    if not key:
-        raise EnvironmentError(
-            "Set GEMINI_API_KEY in your .env file.\n"
-            "Get a free key at: aistudio.google.com/apikey"
-        )
-
-    client = genai.Client(api_key=key)
-    response = client.models.generate_content(
-        model=model,
-        contents=_build_prompt(state, extra_context),
-        config=genai_types.GenerateContentConfig(
-            system_instruction=(
-                "You are a concise, data-driven crypto and equity analyst. "
-                "Follow the exact output format requested. No markdown, no preamble."
-            ),
-            max_output_tokens=512,
-        ),
+    client = _groq_client(api_key)
+    system_msg = (
+        "You are a concise, data-driven crypto and equity analyst. "
+        "Follow the exact output format requested. No markdown, no preamble."
     )
-    raw = response.text
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": _build_prompt(state, extra_context)},
+        ],
+        max_tokens=512,
+        temperature=0.2,
+    )
+    raw = response.choices[0].message.content or ""
     return _parse_response(state.ticker, raw)
 
 
@@ -194,10 +198,8 @@ def _build_btc_prompt(
         else "neutral"
     )
 
-    # Time-on-clock block
     effective_min = minutes_left if minutes_left is not None else float(horizon_minutes)
     urgency = _time_urgency(effective_min)
-    # sigma scaled to actual time remaining
     minutes_per_year = 525_600
     sigma_to_expiry = annual_vol * math.sqrt(effective_min / minutes_per_year)
 
@@ -209,7 +211,6 @@ def _build_btc_prompt(
         f"(1-sigma move = ${current_price * sigma_to_expiry:,.0f})\n"
     )
 
-    # Price action block
     pa_lines = ["\nPRICE ACTION (1h candles):"]
     pa_lines.append(f"  Now       : ${current_price:,.2f}")
     if price_1h_ago:
@@ -276,9 +277,9 @@ def analyse_btc(
     price_2h_ago: float | None = None,
     contracts_context: str = "",
     history_context: str = "",
-    groq_api_key: str | None = None,  # kept for backwards compat, unused
+    groq_api_key: str | None = None,
     news_api_key: str | None = None,
-    model: str = "gemini-2.5-flash",
+    model: str = "llama-3.1-8b-instant",
 ) -> tuple[AnalystReport, dict]:
     """
     Analyse a BTC prediction market contract using live quant signals + news context.
@@ -292,12 +293,7 @@ def analyse_btc(
 
     extra_context, raw_news = build_extra_context(symbol, news_api_key=news_api_key)
 
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        raise EnvironmentError(
-            "Set GEMINI_API_KEY in your .env file.\n"
-            "Get a free key at: aistudio.google.com/apikey"
-        )
+    client = _groq_client(groq_api_key)
 
     prompt = _build_btc_prompt(
         symbol, current_price, annual_vol, annual_drift,
@@ -313,19 +309,15 @@ def analyse_btc(
         "No markdown, no preamble. Be specific about what the live news implies."
     )
 
-    # Fallback chain: primary model -> 8B on 429
-    _FALLBACK_MODEL = "gemini-2.0-flash-lite"
-    client = genai.Client(api_key=key)
-    cfg = genai_types.GenerateContentConfig(system_instruction=system_msg, max_output_tokens=450)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=450,
+        temperature=0.2,
+    )
 
-    try:
-        response = client.models.generate_content(model=model, contents=prompt, config=cfg)
-    except Exception as primary_err:
-        err_str = str(primary_err)
-        if "429" in err_str and model != _FALLBACK_MODEL:
-            response = client.models.generate_content(model=_FALLBACK_MODEL, contents=prompt, config=cfg)
-        else:
-            raise
-
-    raw = response.text
+    raw = response.choices[0].message.content or ""
     return _parse_response(symbol, raw), raw_news

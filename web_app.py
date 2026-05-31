@@ -14,7 +14,9 @@ Features:
 """
 
 import time
+import json
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -24,6 +26,43 @@ import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
+
+LADDER_HORIZON_MINUTES = 15
+LADDER_ANCHOR_MINUTES = 15
+LADDER_LOCK_PATH = Path(__file__).with_name("ladder_strike_lock.json")
+
+
+def _quarter_hour_start(now: datetime) -> datetime:
+    minute = now.minute - (now.minute % LADDER_ANCHOR_MINUTES)
+    return now.replace(minute=minute, second=0, microsecond=0)
+
+
+def _locked_ladder_strike(symbol: str, anchor_et: datetime, live_price: float) -> tuple[float, str]:
+    anchor_key = f"{symbol.upper()}:{anchor_et.isoformat()}"
+    try:
+        data = json.loads(LADDER_LOCK_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+
+    if data.get("anchor_key") == anchor_key:
+        try:
+            return float(data["strike"]), "locked live price"
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    strike = float(live_price)
+    payload = {
+        "anchor_key": anchor_key,
+        "symbol": symbol.upper(),
+        "anchor_et": anchor_et.isoformat(),
+        "strike": strike,
+        "captured_at_et": datetime.now(ZoneInfo("America/New_York")).isoformat(),
+    }
+    try:
+        LADDER_LOCK_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        return strike, "live price"
+    return strike, "new live price lock"
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -108,6 +147,28 @@ def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: in
     sig_T = sigma_over_horizon(annual_vol, horizon)
     return rows, sig_T
 
+
+@st.cache_data(ttl=8)
+def get_anchor_strike_ladder(symbol: str, current_price: float, strike_price: float,
+                             annual_vol: float, horizon: int,
+                             annual_drift: float = 0.0, tail_dof: float = 30.0,
+                             calibration=None):
+    from stock_agent.prediction_market import (
+        calibrate_probability, fair_prob_yes, sigma_over_horizon,
+    )
+
+    raw_yes = fair_prob_yes(
+        current_price, strike_price, annual_vol, horizon, annual_drift, tail_dof
+    )
+    p_yes = calibrate_probability(raw_yes, calibration)
+    sig_T = sigma_over_horizon(annual_vol, horizon)
+    return [{
+        "strike": round(strike_price, 2),
+        "raw_fair_yes": raw_yes,
+        "fair_yes": p_yes,
+        "fair_no": 1 - p_yes,
+        "sigma_T": sig_T,
+    }], sig_T
 
 
 _AI_CACHE_TTL = 900  # 15 min → 96 calls/day × 1900 tokens = ~182K tokens/day
@@ -204,6 +265,11 @@ current_price = price_data["price"]
 if price_data.get("warning"):
     st.warning(f"Robinhood unavailable; using yfinance price. {price_data['warning']}")
 
+_ladder_anchor_et = _quarter_hour_start(datetime.now(ZoneInfo("America/New_York")))
+ladder_strike, ladder_anchor_source = _locked_ladder_strike(
+    symbol, _ladder_anchor_et, current_price
+)
+
 try:
     df_intraday, annual_vol, annual_drift, vol_source, tail_dof, signal_details, calibration, vol_est = get_intraday(
         symbol, vol_window=vol_window, horizon=horizon
@@ -217,8 +283,15 @@ funding_rate, funding_drift, funding_status = get_funding(symbol)
 # Blend: 75% chart/momentum signal + 25% funding rate contrarian signal
 annual_drift = annual_drift * 0.75 + funding_drift * 0.25
 
-from stock_agent.prediction_market import sigma_over_horizon
+from stock_agent.prediction_market import build_probability_calibration, sigma_over_horizon
 sig_T = sigma_over_horizon(annual_vol, horizon)
+ladder_calibration = (
+    calibration
+    if horizon == LADDER_HORIZON_MINUTES
+    else build_probability_calibration(
+        df_intraday, horizon_minutes=LADDER_HORIZON_MINUTES, vol_window=vol_window
+    )
+)
 
 # Momentum label — driven by chart signal now
 ema_cross = signal_details["ema_cross"]
@@ -337,12 +410,12 @@ def _ai_trade_side(contract_action: str | None) -> str | None:
 def _ai_gate_reason(contract_action: str | None, quant_side: str) -> tuple[bool, str]:
     ai_side = _ai_trade_side(contract_action)
     if ai_side == "SKIP":
-        return False, "Gemini chose SKIP"
+        return False, "Groq chose SKIP"
     if ai_side is None:
-        return False, "Gemini did not give a clear BUY YES/BUY NO decision"
+        return False, "Groq did not give a clear BUY YES/BUY NO decision"
     if ai_side != quant_side:
-        return False, f"Gemini chose {ai_side}, quant chose {quant_side}"
-    return True, f"Gemini approved {quant_side}"
+        return False, f"Groq chose {ai_side}, quant chose {quant_side}"
+    return True, f"Groq approved {quant_side}"
 
 
 if "kxbtcd_markets" not in st.session_state:
@@ -532,21 +605,23 @@ with left:
 
     # Probability distribution chart
     st.subheader("Fair Probability Distribution")
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon,
-                                annual_drift, tail_dof, calibration)
+    ladder_rows, _ = get_anchor_strike_ladder(
+        symbol, current_price, ladder_strike, annual_vol, LADDER_HORIZON_MINUTES,
+        annual_drift, tail_dof, ladder_calibration
+    )
     strikes   = [r["strike"] for r in ladder_rows]
     p_yes_vals = [r["fair_yes"] * 100 for r in ladder_rows]
 
     fig2 = go.Figure()
-    colors = ["#00d4aa" if s <= current_price else "#ff6b6b" for s in strikes]
+    colors = ["#00d4aa" if current_price >= s else "#ff6b6b" for s in strikes]
     fig2.add_trace(go.Bar(
         x=strikes,
         y=p_yes_vals,
         marker_color=colors,
         name="P(Yes) %",
     ))
-    fig2.add_vline(x=current_price, line_dash="dot", line_color="yellow",
-                   annotation_text="Spot")
+    fig2.add_vline(x=ladder_strike, line_dash="dot", line_color="yellow",
+                   annotation_text="15m strike")
     fig2.update_layout(
         height=220,
         margin=dict(l=0, r=0, t=10, b=0),
@@ -561,8 +636,8 @@ with left:
     st.plotly_chart(fig2, use_container_width=True)
 
     # -- AI Analysis ----------------------------------------------------------
-    st.subheader("AI Analysis (Gemini Flash + Live News)")
-    st.caption("Gemini 1.5 Flash reads Fear & Greed + CryptoPanic headlines — refreshes every 15 min (auto-fallback to Flash-8B on rate limit)")
+    st.subheader("AI Analysis (Groq Llama + Live News)")
+    st.caption("Groq llama-3.1-8b-instant reads Fear & Greed + CryptoPanic headlines — refreshes every 15 min")
 
     report, raw_news, ai_error = get_ai_analysis(
         symbol, current_price, annual_vol, annual_drift,
@@ -610,7 +685,7 @@ with left:
             else:
                 st.info(f"**AI: {report.contract_action}**")
 
-        # Auto-log: quant proposes the highest-edge contract; Gemini must approve the side.
+        # Auto-log: quant proposes the highest-edge contract; Groq must approve the side.
         _best_contract = next(
             (r for r in sorted(_kx_evaluated, key=lambda r: r["edge_pct"], reverse=True)
              if r["action"] in ("BUY YES", "BUY NO") and _market_is_live(r)),
@@ -686,18 +761,23 @@ with left:
 
 # ---- Probability ladder + contract evaluator -------------------------------
 with right:
-    st.subheader("Probability Ladder")
-    st.caption("Compare these to Robinhood's contract prices to find edge.")
+    st.subheader("Ladder for 15 minute")
+    st.caption(
+        f"Strike ${ladder_strike:,.2f} from {_ladder_anchor_et.strftime('%H:%M ET')} "
+        f"({ladder_anchor_source}). Compare these to Robinhood's contract prices to find edge."
+    )
 
-    ladder_rows, _ = get_ladder(symbol, current_price, annual_vol, horizon,
-                                annual_drift, tail_dof, calibration)
+    ladder_rows, _ = get_anchor_strike_ladder(
+        symbol, current_price, ladder_strike, annual_vol, LADDER_HORIZON_MINUTES,
+        annual_drift, tail_dof, ladder_calibration
+    )
     df_ladder = pd.DataFrame(ladder_rows)
     df_ladder["Strike"]  = df_ladder["strike"].map(lambda x: f"${x:,.2f}")
     df_ladder["Raw"]     = df_ladder["raw_fair_yes"].map(lambda x: f"{x:.1%}")
     df_ladder["Cal"]     = df_ladder["fair_yes"].map(lambda x: f"{x:.1%}")
     df_ladder["P(No)"]   = df_ladder["fair_no"].map(lambda x: f"{x:.1%}")
     df_ladder["ATM"]     = df_ladder["strike"].map(
-        lambda x: "<<" if abs(x - current_price) / current_price < 0.002 else ""
+        lambda x: "<<" if abs(x - ladder_strike) / ladder_strike < 0.002 else ""
     )
 
     st.dataframe(
