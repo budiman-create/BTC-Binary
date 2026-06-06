@@ -39,7 +39,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-MIN_LOG_MINUTES_LEFT = _env_float("MIN_LOG_MINUTES_LEFT", 5.0)
+MIN_LOG_MINUTES_LEFT = _env_float("MIN_LOG_MINUTES_LEFT", 20.0)
 REPEAT_LOG_MINUTES = _env_float("REPEAT_LOG_MINUTES", 5.0)
 
 

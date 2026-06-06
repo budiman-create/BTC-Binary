@@ -467,7 +467,7 @@ if st.session_state.get("kxbtcd_markets"):
     from stock_agent.trading import TradeParams, Signal
 
     _tp_kx = TradeParams(bankroll=bankroll, kelly_fraction=0.25,
-                         max_position_pct=0.10, min_edge_pct=0.15,
+                         max_position_pct=0.10, min_edge_pct=0.30,
                          transaction_cost_pct=0.02)
     for _m in st.session_state["kxbtcd_markets"]:
         if not _market_is_live(_m):

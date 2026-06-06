@@ -47,7 +47,7 @@ VOL_WINDOW  = 60        # 1-hour candles
 BANKROLL    = 1000
 KELLY       = 0.25
 MAX_POS_PCT = 0.10
-MIN_EDGE    = 0.15      # must match web_app TradeParams min_edge_pct
+MIN_EDGE    = 0.30      # must match web_app TradeParams min_edge_pct
 
 
 def _env_float(name: str, default: float) -> float:
@@ -57,7 +57,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-MIN_MINUTES = _env_float("MIN_LOG_MINUTES_LEFT", 5.0)
+MIN_MINUTES = _env_float("MIN_LOG_MINUTES_LEFT", 20.0)
 
 ET = ZoneInfo("America/New_York")
 
