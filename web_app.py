@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-LADDER_HORIZON_MINUTES = 60
+LADDER_HORIZON_MINUTES = 15
 LADDER_ANCHOR_MINUTES = 15
 LADDER_LOCK_PATH = Path(__file__).with_name("ladder_strike_lock.json")
 
@@ -152,27 +152,23 @@ def get_ladder(symbol: str, current_price: float, annual_vol: float, horizon: in
 def get_anchor_strike_ladder(symbol: str, current_price: float, strike_price: float,
                              annual_vol: float, horizon: int,
                              annual_drift: float = 0.0, tail_dof: float = 30.0,
-                             calibration=None,
-                             num_strikes: int = 11, step: float = 1_000.0):
+                             calibration=None):
     from stock_agent.prediction_market import (
         calibrate_probability, fair_prob_yes, sigma_over_horizon,
     )
+
+    raw_yes = fair_prob_yes(
+        current_price, strike_price, annual_vol, horizon, annual_drift, tail_dof
+    )
+    p_yes = calibrate_probability(raw_yes, calibration)
     sig_T = sigma_over_horizon(annual_vol, horizon)
-    center = round(current_price / step) * step
-    half = num_strikes // 2
-    rows = []
-    for i in range(num_strikes):
-        s = center + (i - half) * step
-        raw_yes = fair_prob_yes(current_price, s, annual_vol, horizon, annual_drift, tail_dof)
-        p_yes = calibrate_probability(raw_yes, calibration)
-        rows.append({
-            "strike": round(s, 2),
-            "raw_fair_yes": raw_yes,
-            "fair_yes": p_yes,
-            "fair_no": 1 - p_yes,
-            "sigma_T": sig_T,
-        })
-    return rows, sig_T
+    return [{
+        "strike": round(strike_price, 2),
+        "raw_fair_yes": raw_yes,
+        "fair_yes": p_yes,
+        "fair_no": 1 - p_yes,
+        "sigma_T": sig_T,
+    }], sig_T
 
 
 _AI_CACHE_TTL = 900  # 15 min → 96 calls/day × 1900 tokens = ~182K tokens/day
@@ -624,14 +620,19 @@ with left:
         marker_color=colors,
         name="P(Yes) %",
     ))
-    fig2.add_vline(x=current_price, line_dash="dot", line_color="yellow",
-                   annotation_text=f"now ${current_price:,.0f}")
+    fig2.add_vline(x=ladder_strike, line_dash="dot", line_color="yellow",
+                   annotation_text="15m strike")
     fig2.update_layout(
         height=220,
         margin=dict(l=0, r=0, t=10, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0.1)",
-        xaxis=dict(showgrid=False, color="#aaa", tickformat=",.0f", autorange="reversed"),
+        xaxis=dict(
+            showgrid=False, color="#aaa", tickformat=",.0f",
+            range=[ladder_strike - 2000, ladder_strike + 2000],
+            tickvals=[ladder_strike - 2000, ladder_strike - 1000, ladder_strike,
+                      ladder_strike + 1000, ladder_strike + 2000],
+        ),
         yaxis=dict(showgrid=True, gridcolor="#333", color="#aaa",
                    title="P(Yes) %", range=[0, 100]),
         font=dict(color="#ccc"),
