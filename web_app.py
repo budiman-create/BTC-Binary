@@ -621,8 +621,6 @@ with left:
         marker_color=colors,
         name="P(Yes) %",
     ))
-    fig2.add_vline(x=f"${ladder_strike:,.0f}", line_dash="dot", line_color="yellow",
-                   annotation_text="15m strike")
     fig2.update_layout(
         height=220,
         margin=dict(l=0, r=0, t=10, b=0),
