@@ -97,9 +97,15 @@ def kxbtcd_event_ticker(dt: datetime.datetime | None = None, hour_et: int = 11) 
     Kalshi format: KXBTCD-{YY}{MON}{DD}{HH}
     e.g. today 11AM ET = KXBTCD-26MAY2511
     """
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
     if dt is None:
-        # Approximate ET: UTC-4 (EDT, roughly May-Nov)
-        dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
+        dt = datetime.datetime.now(_ET)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_ET)
+    # If the target hour has already passed today, the contract is for tomorrow.
+    if hour_et < dt.hour:
+        dt = dt + datetime.timedelta(days=1)
     yy  = dt.strftime("%y")
     mon = dt.strftime("%b").upper()
     dd  = dt.strftime("%d")

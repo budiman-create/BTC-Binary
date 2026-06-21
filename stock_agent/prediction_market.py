@@ -767,10 +767,14 @@ def evaluate_range_contract(
     params: TradeParams = TradeParams(),
     annual_drift: float = 0.0,
     tail_dof: float = 30.0,
+    calibration: CalibrationReport | None = None,
 ) -> ContractDecision:
     """Evaluate a Kalshi-style price range contract."""
     raw_fair = fair_prob_range(current_price, low, high, annual_vol,
                                horizon_minutes, annual_drift, tail_dof)
+    # Calibration is an approximation for range contracts (built on point probs),
+    # but better than skipping it entirely for near-ATM contracts.
+    fair = calibrate_probability(raw_fair, calibration)
     sig_T = sigma_over_horizon(annual_vol, horizon_minutes)
     if low is None:
         description = f"{symbol} <= ${high:,.2f}"
@@ -782,7 +786,7 @@ def evaluate_range_contract(
         description = f"{symbol} ${low:,.2f}-${high:,.2f}"
         strike_for_sort = low
     return _decision_from_probability(
-        symbol, strike_for_sort, contract_yes_price, raw_fair, raw_fair,
+        symbol, strike_for_sort, contract_yes_price, fair, raw_fair,
         sig_T, params, description
     )
 
