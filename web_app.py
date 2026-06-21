@@ -609,30 +609,26 @@ with left:
         symbol, current_price, ladder_strike, annual_vol, LADDER_HORIZON_MINUTES,
         annual_drift, tail_dof, ladder_calibration
     )
-    strikes   = [r["strike"] for r in ladder_rows]
-    p_yes_vals = [r["fair_yes"] * 100 for r in ladder_rows]
+    strikes     = [r["strike"] for r in ladder_rows]
+    p_yes_vals  = [r["fair_yes"] * 100 for r in ladder_rows]
+    strike_labels = [f"${s:,.0f}" for s in strikes]
 
     fig2 = go.Figure()
     colors = ["#00d4aa" if current_price >= s else "#ff6b6b" for s in strikes]
     fig2.add_trace(go.Bar(
-        x=strikes,
+        x=strike_labels,
         y=p_yes_vals,
         marker_color=colors,
         name="P(Yes) %",
     ))
-    fig2.add_vline(x=ladder_strike, line_dash="dot", line_color="yellow",
+    fig2.add_vline(x=f"${ladder_strike:,.0f}", line_dash="dot", line_color="yellow",
                    annotation_text="15m strike")
     fig2.update_layout(
         height=220,
         margin=dict(l=0, r=0, t=10, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0.1)",
-        xaxis=dict(
-            showgrid=False, color="#aaa", tickformat=",.0f",
-            range=[ladder_strike - 2000, ladder_strike + 2000],
-            tickvals=[ladder_strike - 2000, ladder_strike - 1000, ladder_strike,
-                      ladder_strike + 1000, ladder_strike + 2000],
-        ),
+        xaxis=dict(showgrid=False, color="#aaa"),
         yaxis=dict(showgrid=True, gridcolor="#333", color="#aaa",
                    title="P(Yes) %", range=[0, 100]),
         font=dict(color="#ccc"),
