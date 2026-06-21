@@ -631,7 +631,7 @@ with left:
         margin=dict(l=0, r=0, t=10, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0.1)",
-        xaxis=dict(showgrid=False, color="#aaa", tickformat=",.0f"),
+        xaxis=dict(showgrid=False, color="#aaa", tickformat=",.0f", autorange="reversed"),
         yaxis=dict(showgrid=True, gridcolor="#333", color="#aaa",
                    title="P(Yes) %", range=[0, 100]),
         font=dict(color="#ccc"),
