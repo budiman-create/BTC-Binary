@@ -1,0 +1,542 @@
+<title>BTC · 1h Probability Map</title>
+<style>
+  :root {
+    --ground:   #06101A;
+    --text:     #C8D8E8;
+    --accent:   #2BE2FF;
+    --accent-2: #FF8C42;
+    --muted:    #152030;
+    --dim:      #3A5060;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--ground);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ─────────────────────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--muted);
+    flex-shrink: 0;
+  }
+  .hd-ticker {
+    font-family: 'Courier New', monospace;
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    color: var(--dim);
+    text-transform: uppercase;
+    line-height: 1.4;
+  }
+  .hd-ticker strong {
+    display: block;
+    font-size: 11px;
+    color: var(--text);
+    letter-spacing: 0.08em;
+  }
+  .hd-price {
+    font-family: 'Courier New', monospace;
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+  .hd-stats {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+  .hd-stat { display: flex; flex-direction: column; gap: 2px; }
+  .hd-stat-l {
+    font-size: 8px;
+    letter-spacing: 0.12em;
+    color: var(--dim);
+    text-transform: uppercase;
+  }
+  .hd-stat-v {
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    color: var(--text);
+  }
+  .hd-badge {
+    margin-left: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    border: 1px solid rgba(43,226,255,0.28);
+    padding: 4px 12px;
+    border-radius: 2px;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+  }
+
+  /* ── Chart ──────────────────────────────────────────────── */
+  .chart-wrap {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+  }
+  #chart {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+  }
+  #tip {
+    position: absolute;
+    top: 0; left: 0;
+    background: rgba(6,16,26,0.96);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 9px 13px;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: var(--text);
+    pointer-events: none;
+    display: none;
+    line-height: 1.75;
+    white-space: nowrap;
+    z-index: 10;
+  }
+  #tip .tip-price {
+    font-size: 15px;
+    font-weight: bold;
+    margin-bottom: 6px;
+  }
+  #tip .tip-lbl { color: var(--dim); font-size: 9px; letter-spacing: 0.1em; }
+  #tip .up { color: var(--accent); }
+  #tip .dn { color: var(--accent-2); }
+
+  /* ── Footer table ───────────────────────────────────────── */
+  footer {
+    border-top: 1px solid var(--muted);
+    padding: 10px 24px 12px;
+    flex-shrink: 0;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  th {
+    text-align: right;
+    padding: 0 20px 6px 0;
+    color: var(--dim);
+    font-size: 8px;
+    letter-spacing: 0.12em;
+    font-weight: normal;
+    text-transform: uppercase;
+  }
+  th:first-child { text-align: left; padding-left: 0; }
+  td {
+    text-align: right;
+    padding: 4px 20px 4px 0;
+    border-top: 1px solid var(--muted);
+    color: var(--text);
+  }
+  td:first-child { text-align: left; padding-left: 0; }
+  .yes { color: var(--accent); }
+  .no  { color: var(--accent-2); }
+  .hld { color: var(--dim); }
+  .edge-hi { font-weight: bold; }
+  .atm { color: var(--text); }
+</style>
+
+<header>
+  <div class="hd-ticker">
+    <strong>BTC · USD</strong>
+    Kalshi KXBTCD
+  </div>
+  <div class="hd-price">$63,976</div>
+  <div class="hd-stats">
+    <div class="hd-stat">
+      <span class="hd-stat-l">Ann Vol</span>
+      <span class="hd-stat-v">28.4%</span>
+    </div>
+    <div class="hd-stat">
+      <span class="hd-stat-l">1h σ</span>
+      <span class="hd-stat-v" id="sigma-lbl">$194</span>
+    </div>
+    <div class="hd-stat">
+      <span class="hd-stat-l">EMA Cross</span>
+      <span class="hd-stat-v">Bullish</span>
+    </div>
+    <div class="hd-stat">
+      <span class="hd-stat-l">Drift</span>
+      <span class="hd-stat-v">+1.72</span>
+    </div>
+    <div class="hd-stat">
+      <span class="hd-stat-l">Tail dof</span>
+      <span class="hd-stat-v">30 (normal)</span>
+    </div>
+  </div>
+  <div class="hd-badge">60 min horizon</div>
+</header>
+
+<div class="chart-wrap">
+  <canvas id="chart"></canvas>
+  <div id="tip"></div>
+</div>
+
+<footer>
+  <table>
+    <thead>
+      <tr>
+        <th>Contract Range</th>
+        <th>Fair P(Yes)</th>
+        <th>Kalshi</th>
+        <th>Raw Edge</th>
+        <th>Net Edge</th>
+        <th>Min Left</th>
+        <th>Signal</th>
+      </tr>
+    </thead>
+    <tbody id="tbl"></tbody>
+  </table>
+</footer>
+
+<script>
+// ── Model parameters ────────────────────────────────────────────────────────
+const S0        = 63976;
+const annVol    = 0.284;
+const drift     = 1.72;   // annualised, from worker
+const txCost    = 0.02;
+const minEdge   = 0.30;
+const HRS_YEAR  = 8760;
+const sigmaT    = annVol * Math.sqrt(1 / HRS_YEAR);   // ~0.003036
+const stdD      = S0 * sigmaT;                         // ~$194
+
+// ── Math helpers ─────────────────────────────────────────────────────────────
+function normCDF(z) {
+  const a1 =  0.254829592, a2 = -0.284496736,
+        a3 =  1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const sign = z < 0 ? -1 : 1;
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + p * x);
+  const y = 1 - ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t * Math.exp(-x*x);
+  return 0.5 * (1 + sign * y);
+}
+function gausPDF(x) {
+  const z = (x - S0) / stdD;
+  return Math.exp(-0.5*z*z) / (stdD * Math.sqrt(2*Math.PI));
+}
+function rangeProb(lo, hi) {
+  const pL = lo != null ? normCDF((lo - S0) / stdD) : 0;
+  const pH = hi != null ? normCDF((hi - S0) / stdD) : 1;
+  return Math.max(0, pH - pL);
+}
+
+// ── Contracts ────────────────────────────────────────────────────────────────
+const contracts = [
+  { label:'Under $63k',  lo:null,  hi:63000, kalshi: 2, minLeft:'—'  },
+  { label:'$63k – $64k', lo:63000, hi:64000, kalshi:52, minLeft:'68.3' },
+  { label:'$64k – $65k', lo:64000, hi:65000, kalshi:46, minLeft:'68.3' },
+  { label:'Over $65k',   lo:65000, hi:null,  kalshi: 2, minLeft:'—'  },
+];
+
+contracts.forEach(c => {
+  c.fair = rangeProb(c.lo, c.hi);
+  const k = c.kalshi / 100;
+  if (c.fair > k) {
+    c.rawEdge = c.fair - k;
+    c.netEdge = c.rawEdge - txCost;
+    c.side = 'YES';
+  } else {
+    c.rawEdge = k - c.fair;
+    c.netEdge = c.rawEdge - txCost;
+    c.side = 'NO';
+  }
+  c.signal = c.netEdge >= minEdge ? (c.side === 'YES' ? 'BUY YES' : 'BUY NO') : 'HOLD';
+});
+
+// ── Populate table ────────────────────────────────────────────────────────────
+const tbl = document.getElementById('tbl');
+contracts.forEach(c => {
+  const sigClass = c.signal === 'BUY YES' ? 'yes' : c.signal === 'BUY NO' ? 'no' : 'hld';
+  const edgeHi   = c.netEdge >= minEdge ? 'edge-hi' : '';
+  const isATM    = c.lo === 63000 || c.lo === 64000;
+  const netStr   = c.netEdge >= 0
+    ? `+${(c.netEdge*100).toFixed(1)}%`
+    : `${(c.netEdge*100).toFixed(1)}%`;
+  const rawStr   = `+${(c.rawEdge*100).toFixed(1)}%`;
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td class="${isATM ? 'atm' : ''}">${c.label}${isATM ? ' ◈' : ''}</td>
+    <td>${(c.fair*100).toFixed(1)}%</td>
+    <td>${c.kalshi}¢</td>
+    <td>${rawStr}</td>
+    <td class="${edgeHi} ${sigClass}">${netStr}</td>
+    <td>${c.minLeft}</td>
+    <td class="${sigClass}">${c.signal}</td>
+  `;
+  tbl.appendChild(tr);
+});
+
+document.getElementById('sigma-lbl').textContent = '$' + Math.round(stdD);
+
+// ── Canvas rendering ─────────────────────────────────────────────────────────
+const canvas = document.getElementById('chart');
+const ctx    = canvas.getContext('2d');
+const tip    = document.getElementById('tip');
+
+const PMIN = 62200, PMAX = 65800;   // display price window
+const PT = 44, PB = 54;             // top/bottom padding in CSS px
+
+let W = 0, H = 0, DPR = 1;
+let pts = [];           // [{price, d}] across canvas width
+let maxD = 0;
+let progress = 0;       // 0→1 draw-in animation
+let done = false;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  const el = canvas.parentElement;
+  W = el.clientWidth;
+  H = el.clientHeight;
+  canvas.width  = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  buildPts();
+}
+
+function buildPts() {
+  pts = []; maxD = 0;
+  const N = Math.round(W * DPR);
+  for (let i = 0; i <= N; i++) {
+    const price = PMIN + (PMAX - PMIN) * (i / N);
+    const d = gausPDF(price);
+    pts.push({ price, d, px: i });
+    if (d > maxD) maxD = d;
+  }
+}
+
+function pxX(price) {
+  return ((price - PMIN) / (PMAX - PMIN)) * W * DPR;
+}
+
+function pxY(d, padT, chartH) {
+  return padT + chartH - (d / maxD) * chartH * 0.86;
+}
+
+function draw() {
+  if (!W || !H || pts.length === 0) return;
+  const cW = Math.round(W * DPR);
+  const cH = Math.round(H * DPR);
+  const padT  = PT * DPR;
+  const padB  = PB * DPR;
+  const chartH = cH - padT - padB;
+  const clipW  = Math.round(progress * cW);
+
+  ctx.clearRect(0, 0, cW, cH);
+
+  // baseline
+  ctx.strokeStyle = 'rgba(21,32,48,0.8)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, padT + chartH);
+  ctx.lineTo(cW, padT + chartH);
+  ctx.stroke();
+
+  // ── Range bands ───────────────────────────────────────────
+  const bandFill   = { 'BUY YES':'rgba(43,226,255,0.07)', 'BUY NO':'rgba(255,140,66,0.07)', 'HOLD':'rgba(255,255,255,0.02)' };
+  const borderLine = { 'BUY YES':'rgba(43,226,255,0.3)',  'BUY NO':'rgba(255,140,66,0.3)',  'HOLD':'rgba(255,255,255,0.07)' };
+
+  contracts.forEach(c => {
+    const x1 = c.lo != null ? pxX(c.lo) : 0;
+    const x2 = c.hi != null ? pxX(c.hi) : cW;
+    ctx.fillStyle = bandFill[c.signal];
+    ctx.fillRect(x1, padT, x2 - x1, chartH);
+    ctx.strokeStyle = borderLine[c.signal];
+    ctx.lineWidth = 1;
+    if (c.lo != null && c.lo > PMIN) {
+      ctx.beginPath(); ctx.moveTo(x1, padT); ctx.lineTo(x1, padT + chartH); ctx.stroke();
+    }
+    if (c.hi != null && c.hi < PMAX) {
+      ctx.beginPath(); ctx.moveTo(x2, padT); ctx.lineTo(x2, padT + chartH); ctx.stroke();
+    }
+  });
+
+  // ── σ gridlines ────────────────────────────────────────────
+  [1, 2, 3].forEach(n => {
+    [S0 + n*stdD, S0 - n*stdD].forEach(p => {
+      if (p < PMIN || p > PMAX) return;
+      const x = pxX(p);
+      ctx.setLineDash([3, 7]);
+      ctx.strokeStyle = 'rgba(200,216,232,0.06)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + chartH); ctx.stroke();
+      ctx.setLineDash([]);
+    });
+  });
+
+  // ── Probability curve (clipped to progress) ────────────────
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, clipW, cH);
+  ctx.clip();
+
+  // Fill
+  ctx.beginPath();
+  pts.forEach(({ px, d }, i) => {
+    const y = pxY(d, padT, chartH);
+    i === 0 ? ctx.moveTo(px, y) : ctx.lineTo(px, y);
+  });
+  const lastY = padT + chartH;
+  ctx.lineTo(pts[pts.length-1].px, lastY);
+  ctx.lineTo(0, lastY);
+  ctx.closePath();
+  const fillG = ctx.createLinearGradient(0, padT, 0, padT + chartH);
+  fillG.addColorStop(0,    'rgba(43,226,255,0.22)');
+  fillG.addColorStop(0.45, 'rgba(43,226,255,0.08)');
+  fillG.addColorStop(1,    'rgba(43,226,255,0.01)');
+  ctx.fillStyle = fillG;
+  ctx.fill();
+
+  // Glow pass 1
+  ctx.beginPath();
+  pts.forEach(({ px, d }, i) => {
+    const y = pxY(d, padT, chartH);
+    i === 0 ? ctx.moveTo(px, y) : ctx.lineTo(px, y);
+  });
+  ctx.strokeStyle = 'rgba(43,226,255,0.18)';
+  ctx.lineWidth = 10 * DPR;
+  ctx.shadowColor = '#2BE2FF';
+  ctx.shadowBlur = 28 * DPR;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  // Main stroke
+  ctx.beginPath();
+  pts.forEach(({ px, d }, i) => {
+    const y = pxY(d, padT, chartH);
+    i === 0 ? ctx.moveTo(px, y) : ctx.lineTo(px, y);
+  });
+  ctx.strokeStyle = '#2BE2FF';
+  ctx.lineWidth = 1.8 * DPR;
+  ctx.shadowBlur = 14 * DPR;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  ctx.restore();
+
+  // ── Current price line ─────────────────────────────────────
+  const cx = pxX(S0);
+  ctx.setLineDash([6 * DPR, 5 * DPR]);
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.lineWidth = 1 * DPR;
+  ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT + chartH); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Current price label
+  ctx.font = `${10 * DPR}px 'Courier New', monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(200,216,232,0.6)';
+  ctx.fillText('$' + S0.toLocaleString(), cx, padT - 10 * DPR);
+
+  // ── X-axis labels ──────────────────────────────────────────
+  const axisY = padT + chartH + 18 * DPR;
+  ctx.fillStyle = 'rgba(200,216,232,0.35)';
+  ctx.font = `${9 * DPR}px 'Courier New', monospace`;
+
+  for (let p = 62500; p <= 65500; p += 500) {
+    if (p < PMIN || p > PMAX) continue;
+    const x = pxX(p);
+    ctx.textAlign = 'center';
+    ctx.fillText('$' + (p/1000).toFixed(1) + 'k', x, axisY);
+  }
+
+  // σ labels
+  ctx.font = `${8 * DPR}px 'Courier New', monospace`;
+  ctx.fillStyle = 'rgba(200,216,232,0.18)';
+  [1, 2].forEach(n => {
+    [[S0 + n*stdD, `+${n}σ`], [S0 - n*stdD, `-${n}σ`]].forEach(([p, lbl]) => {
+      if (p < PMIN || p > PMAX) return;
+      ctx.textAlign = 'center';
+      ctx.fillText(lbl, pxX(p), axisY + 14 * DPR);
+    });
+  });
+
+  // ── Range labels (fair %) inside bands ────────────────────
+  contracts.forEach(c => {
+    const x1  = c.lo != null ? pxX(c.lo)  : 0;
+    const x2  = c.hi != null ? pxX(c.hi)  : cW;
+    const midX = (x1 + x2) / 2;
+    if (midX < 0 || midX > cW) return;
+
+    const color = c.signal === 'BUY YES' ? '#2BE2FF'
+                : c.signal === 'BUY NO'  ? '#FF8C42'
+                : 'rgba(200,216,232,0.25)';
+    ctx.fillStyle = color;
+    ctx.font = `bold ${9 * DPR}px 'Courier New', monospace`;
+    ctx.textAlign = 'center';
+
+    const fairStr = (c.fair * 100).toFixed(1) + '%';
+    ctx.fillText(fairStr, midX, padT + 18 * DPR);
+
+    if (c.signal !== 'HOLD') {
+      ctx.font = `${8 * DPR}px -apple-system, system-ui, sans-serif`;
+      ctx.fillStyle = color;
+      ctx.fillText(c.signal, midX, padT + 30 * DPR);
+    }
+  });
+}
+
+// ── Animation ─────────────────────────────────────────────────────────────────
+function frame() {
+  if (!done) {
+    progress = Math.min(1, progress + 0.014);
+    if (progress >= 1) done = true;
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// ── Hover ──────────────────────────────────────────────────────────────────────
+canvas.addEventListener('mousemove', e => {
+  const r   = canvas.getBoundingClientRect();
+  const relX = e.clientX - r.left;
+  const relY = e.clientY - r.top;
+  const price = PMIN + (PMAX - PMIN) * (relX / W);
+  if (price < PMIN || price > PMAX) { tip.style.display = 'none'; return; }
+
+  const pBelow = normCDF((price - S0) / stdD);
+  const pAbove = 1 - pBelow;
+  const inC = contracts.find(c => (c.lo == null || price >= c.lo) && (c.hi == null || price < c.hi));
+
+  const left = relX + 16 < W - 160 ? (relX + 16) : (relX - 160);
+  tip.style.left    = left + 'px';
+  tip.style.top     = (relY - 10) + 'px';
+  tip.style.display = 'block';
+  tip.innerHTML = `
+    <div class="tip-lbl">BTC IN 60 MIN</div>
+    <div class="tip-price">$${Math.round(price).toLocaleString()}</div>
+    <div>P(above) <span class="up">${(pAbove*100).toFixed(2)}%</span></div>
+    <div>P(below) <span class="dn">${(pBelow*100).toFixed(2)}%</span></div>
+    ${inC ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(200,216,232,0.1)">
+      <span style="color:var(--dim)">Range</span> ${inC.label}<br>
+      <span style="color:var(--dim)">Fair</span> ${(inC.fair*100).toFixed(1)}%
+      &nbsp;·&nbsp; <span style="color:var(--dim)">Kalshi</span> ${inC.kalshi}¢
+    </div>` : ''}
+  `;
+});
+canvas.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+
+// ── Responsive ────────────────────────────────────────────────────────────────
+window.addEventListener('resize', () => { resize(); progress = 1; done = true; draw(); });
+@media (prefers-reduced-motion: reduce) { done = true; progress = 1; }
+
+resize();
+requestAnimationFrame(frame);
+</script>
