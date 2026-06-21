@@ -46,7 +46,7 @@ VOL_WINDOW  = 60        # 1-hour candles
 BANKROLL    = 1000
 KELLY       = 0.25
 MAX_POS_PCT = 0.10
-MIN_EDGE    = 0.30      # must match web_app TradeParams min_edge_pct
+MIN_EDGE    = 0.08      # must match web_app TradeParams min_edge_pct
 
 CHART_DRIFT_WEIGHT   = 0.75   # matches web_app: annual_drift * 0.75 + funding_drift * 0.25
 FUNDING_DRIFT_WEIGHT = 0.25
